@@ -43,6 +43,7 @@ CREATE TABLE IF NOT EXISTS taf_forecasts (
     fetched_utc TEXT NOT NULL,
     tx_c REAL,
     tx_time_utc TEXT,
+    forecast_local_date TEXT,
     tn_c REAL,
     tn_time_utc TEXT,
     raw_taf TEXT,
@@ -104,6 +105,7 @@ CREATE TABLE IF NOT EXISTS weather_markets (
     resolution_status TEXT,
     settled_at_utc TEXT,
     active INTEGER DEFAULT 1,
+    cancelled_at_utc TEXT,
     created_at TEXT DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS ix_weather_city_date
@@ -152,11 +154,17 @@ CREATE INDEX IF NOT EXISTS ix_fetchlog_source
 
 CREATE TABLE IF NOT EXISTS alerts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    ts_utc TEXT NOT NULL,
+    opened_utc TEXT NOT NULL,
+    last_seen_utc TEXT NOT NULL,
     city TEXT NOT NULL,
+    settlement_date TEXT,
     alert_type TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'open',
+    closed_utc TEXT,
     detail_json TEXT
 );
+CREATE INDEX IF NOT EXISTS ix_alerts_open
+    ON alerts(city, alert_type, status, settlement_date);
 
 CREATE TABLE IF NOT EXISTS settlement_observations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -189,6 +197,11 @@ CREATE TABLE IF NOT EXISTS market_resolutions (
 
 
 def init_db(conn: sqlite3.Connection) -> None:
+    # WAL mode: allows concurrent readers + one writer; millisecond lock windows.
+    # Must be set before schema DDL to take effect on new databases.
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=10000")   # wait up to 10s on lock before raising
+    conn.execute("PRAGMA synchronous=NORMAL")   # safe with WAL; faster than FULL
     _migrate_existing_tables(conn)
     conn.executescript(SCHEMA_SQL)
     conn.commit()
@@ -233,6 +246,7 @@ def _migrate_existing_tables(conn: sqlite3.Connection) -> None:
     })
     _add_missing_columns(conn, "taf_forecasts", {
         "raw_payload_json": "TEXT",
+        "forecast_local_date": "TEXT",
     })
     _add_missing_columns(conn, "model_forecasts", {
         "model_run_is_estimated": "INTEGER DEFAULT 1",
@@ -263,6 +277,14 @@ def _migrate_existing_tables(conn: sqlite3.Connection) -> None:
         "settlement_rounding_rule": "TEXT",
         "resolution_status": "TEXT",
         "settled_at_utc": "TEXT",
+        "cancelled_at_utc": "TEXT",
+    })
+    _add_missing_columns(conn, "alerts", {
+        "opened_utc": "TEXT",
+        "last_seen_utc": "TEXT",
+        "settlement_date": "TEXT",
+        "status": "TEXT DEFAULT 'open'",
+        "closed_utc": "TEXT",
     })
     _add_missing_columns(conn, "ob_snapshots", {
         "yes_bid_size": "REAL",
