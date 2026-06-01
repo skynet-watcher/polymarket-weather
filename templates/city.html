@@ -165,6 +165,127 @@
   </div>
 </div>
 
+{# ── PEAK TIMING BAR ── #}
+{% set pi = d.peak_info %}
+{% if pi %}
+<div class="card" style="margin-bottom:16px">
+  <div class="card-header">Daily High — Expected Peak Window</div>
+  <div style="padding:14px 16px">
+    <div style="display:flex;gap:20px;align-items:flex-start;flex-wrap:wrap">
+
+      {# Text summary #}
+      <div style="min-width:200px">
+        <div style="font-size:22px;font-weight:700;
+          color:{% if pi.peak_passed %}var(--green){% elif pi.at_peak %}var(--yellow){% else %}var(--blue){% endif %}">
+          {% if pi.peak_passed %}
+            ✓ Peak likely passed
+          {% elif pi.at_peak %}
+            🌡 In peak window now
+          {% elif pi.hours_to_peak > 0 %}
+            Peak in {{ '%.1f'|format(pi.hours_to_peak) }}h
+          {% else %}
+            Peak {{ '%.1f'|format(-pi.hours_to_peak) }}h ago
+          {% endif %}
+        </div>
+        <div style="margin-top:6px;font-size:13px;color:var(--muted)">
+          Typical peak: <strong style="color:var(--text)">{{ '%02d'|format(pi.peak_local_hour) }}:00 local</strong>
+          ± {{ pi.peak_std_h }}h
+          &nbsp;·&nbsp;
+          {{ pi.tz_name.split('/')[-1] if pi.tz_name else '' }}
+        </div>
+        {% if d.metar_high %}
+        <div style="margin-top:6px;font-size:13px">
+          Current daily high:
+          <strong style="color:var(--green)">{{ '%.1f'|format(d.metar_high) }}°{{ d.bucket_unit }}</strong>
+        </div>
+        {% endif %}
+      </div>
+
+      {# 24-hour timeline bar #}
+      <div style="flex:1;min-width:260px">
+        <div style="font-size:11px;color:var(--muted);margin-bottom:6px">
+          Local hour timeline (midnight → midnight)
+        </div>
+        <div style="position:relative;height:32px;background:var(--bg);border-radius:6px;overflow:hidden">
+
+          {# Peak window shading (±std_h around peak) #}
+          {% set peak_h = pi.peak_local_hour %}
+          {% set std_h  = pi.peak_std_h or 1.5 %}
+          {% set win_start_pct = (((peak_h - std_h) / 24) * 100) | round(1) %}
+          {% set win_w_pct     = ((std_h * 2 / 24) * 100) | round(1) %}
+          <div style="position:absolute;left:{{ [win_start_pct,0]|max }}%;
+                        width:{{ win_w_pct }}%;height:100%;
+                        background:rgba(245,158,11,0.20);border-left:2px solid rgba(245,158,11,0.5);
+                        border-right:2px solid rgba(245,158,11,0.5)"></div>
+
+          {# Peak centre line #}
+          {% set peak_pct = ((peak_h / 24) * 100) | round(1) %}
+          <div style="position:absolute;left:{{ peak_pct }}%;top:0;bottom:0;width:2px;
+                        background:var(--yellow);opacity:0.9"></div>
+
+          {# Trading close line #}
+          {# close_time_utc → convert to local hour #}
+          {# Approximate: just mark 12:00 UTC as a reference #}
+
+          {# Current time cursor #}
+          {% if pi.hours_to_peak is defined %}
+            {% set now_local_h = peak_h - pi.hours_to_peak %}
+            {% if 0 <= now_local_h <= 24 %}
+              {% set now_pct = ((now_local_h / 24) * 100) | round(1) %}
+              <div style="position:absolute;left:{{ now_pct }}%;top:0;bottom:0;width:2px;
+                            background:white;opacity:0.7"></div>
+              {# Current daily high bar #}
+              {% if d.metar_high %}
+              <div style="position:absolute;left:0;top:0;bottom:0;width:{{ now_pct }}%;
+                            background:rgba(34,197,94,0.12)"></div>
+              {% endif %}
+            {% endif %}
+          {% endif %}
+        </div>
+
+        {# Hour labels #}
+        <div style="display:flex;justify-content:space-between;font-size:10px;
+                     color:var(--muted);margin-top:4px;padding:0 2px">
+          <span>00:00</span><span>06:00</span><span>12:00</span><span>18:00</span><span>24:00</span>
+        </div>
+
+        {# Legend #}
+        <div style="display:flex;gap:12px;margin-top:8px;font-size:11px;color:var(--muted);flex-wrap:wrap">
+          <span style="display:flex;align-items:center;gap:4px">
+            <span style="display:inline-block;width:10px;height:10px;background:rgba(245,158,11,0.3);border-radius:2px"></span>
+            Peak window ±{{ pi.peak_std_h }}h
+          </span>
+          <span style="display:flex;align-items:center;gap:4px">
+            <span style="display:inline-block;width:2px;height:10px;background:var(--yellow)"></span>
+            Typical peak {{ '%02d'|format(pi.peak_local_hour) }}:00
+          </span>
+          <span style="display:flex;align-items:center;gap:4px">
+            <span style="display:inline-block;width:2px;height:10px;background:white;opacity:0.7"></span>
+            Now
+          </span>
+        </div>
+
+        {% if d.market_type == 'C' %}
+        <div style="margin-top:8px;padding:6px 10px;background:rgba(59,130,246,0.1);
+                     border-radius:6px;font-size:11px;color:var(--blue)">
+          ℹ Type C — trading closes before peak. Afternoon METAR data does not affect position.
+          Settlement uses full local calendar day regardless.
+        </div>
+        {% endif %}
+        {% if d.city == 'Madrid' %}
+        <div style="margin-top:8px;padding:6px 10px;background:rgba(245,158,11,0.1);
+                     border-radius:6px;font-size:11px;color:var(--yellow)">
+          ⚠ Madrid peaks at 17:00 local (15:00 UTC) — 3h after trading close.
+          Acts like Type C: forecasts matter more than intraday METAR.
+        </div>
+        {% endif %}
+      </div>
+
+    </div>
+  </div>
+</div>
+{% endif %}
+
 {# ── MAIN DETAIL GRID ── #}
 <div class="detail-grid">
 

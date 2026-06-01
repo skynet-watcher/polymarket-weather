@@ -167,9 +167,35 @@ def get_overview(conn) -> list[dict]:
         else:
             status = "unknown"
 
-        # Market type
-        tz   = _city_tz(conn, city)
+        # Market type + peak timing
+        tz    = _city_tz(conn, city)
         mtype = _market_type(city)
+
+        # Load peak hour from config
+        import json as _j
+        cfg_path = Path(__file__).parent.parent / "data" / "city_stations.json"
+        peak_local_hour = None
+        peak_std_h      = None
+        try:
+            cfg = _j.loads(cfg_path.read_text())
+            cm  = next((c for c in cfg["cities"] if c["city"] == city), {})
+            peak_local_hour = cm.get("typical_peak_local_hour")
+            peak_std_h      = cm.get("peak_std_h")
+        except Exception:
+            pass
+
+        peak_info = {}
+        if peak_local_hour and tz:
+            now_local = _now_utc().astimezone(ZoneInfo(tz))
+            cur_h = now_local.hour + now_local.minute / 60
+            htp = peak_local_hour - cur_h
+            peak_info = {
+                "peak_local_hour": peak_local_hour,
+                "peak_std_h":      peak_std_h,
+                "hours_to_peak":   round(htp, 1),
+                "peak_passed":     htp < -(peak_std_h or 1.5),
+                "at_peak":         abs(htp) <= (peak_std_h or 1.5),
+            }
 
         results.append({
             "city":          city,
@@ -180,6 +206,7 @@ def get_overview(conn) -> list[dict]:
             "status":        status,
             "market_type":   mtype,
             "timezone":      tz,
+            "peak_info":     peak_info,
             "top_bucket":    dict(top) if top else None,
             "metar_high":    metar["daily_high"] if metar else None,
             "fcst_avg":      round(fcst["avg_high"], 1) if fcst and fcst["avg_high"] else None,
@@ -209,11 +236,41 @@ def get_city_detail(conn, city: str) -> dict:
     if not row:
         return {}
 
-    sdate  = row["settlement_date"]
-    close  = row["close_time_utc"]
-    unit   = row["bucket_unit"]
+    sdate   = row["settlement_date"]
+    close   = row["close_time_utc"]
+    unit    = row["bucket_unit"]
     station = row["station"]
-    htc    = _hours_to(close)
+    htc     = _hours_to(close)
+
+    # Load peak timing from city_stations.json
+    import json as _json
+    cfg_path = REPO_ROOT / "data" / "city_stations.json"
+    city_meta: dict = {}
+    try:
+        cfg = _json.loads(cfg_path.read_text())
+        city_meta = next((c for c in cfg["cities"] if c["city"] == city), {})
+    except Exception:
+        pass
+    peak_local_hour = city_meta.get("typical_peak_local_hour")
+    peak_std_h      = city_meta.get("peak_std_h")
+    tz_name         = city_meta.get("timezone", "UTC")
+
+    # Compute hours until / since expected peak today (in local time)
+    peak_info: dict = {}
+    if peak_local_hour is not None:
+        now_local = _now_utc().astimezone(ZoneInfo(tz_name))
+        cur_local_h = now_local.hour + now_local.minute / 60
+        hours_to_peak = peak_local_hour - cur_local_h
+        # Peak already passed if hours_to_peak < 0
+        peak_info = {
+            "peak_local_hour": peak_local_hour,
+            "peak_std_h":      peak_std_h,
+            "hours_to_peak":   round(hours_to_peak, 1),
+            "peak_passed":     hours_to_peak < -(peak_std_h or 1.5),
+            "at_peak":         abs(hours_to_peak) <= (peak_std_h or 1.5),
+            "peak_local_str":  f"{peak_local_hour:02d}:00 local",
+            "tz_name":         tz_name,
+        }
 
     # All buckets with latest price
     buckets = conn.execute("""
@@ -324,6 +381,7 @@ def get_city_detail(conn, city: str) -> dict:
         "price_history":   price_history,
         "metar_path":      [dict(r) for r in metar_path],
         "metar_high":      metar_high,
+        "peak_info":       peak_info,
         "alerts":          [dict(a) for a in alerts],
         "settle_obs":      dict(settle_obs) if settle_obs else None,
     }

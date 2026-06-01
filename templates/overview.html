@@ -157,7 +157,26 @@
     {% endif %}
   {% endif %}
 
-  {# Time to close #}
+  {# Peak timing + time to close #}
+  {% set pi = c.peak_info %}
+  {% if pi %}
+  <div style="font-size:11px;display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+    {% if pi.peak_passed %}
+      <span style="color:var(--green)">✓ Peak passed</span>
+      <span style="color:var(--muted)">(~{{ pi.peak_local_hour }}:00 local)</span>
+    {% elif pi.at_peak %}
+      <span style="color:var(--yellow)">🌡 Peak window now</span>
+      <span style="color:var(--muted)">(~{{ pi.peak_local_hour }}:00 local)</span>
+    {% else %}
+      {% set htp = pi.hours_to_peak %}
+      <span style="color:var(--muted)">Peak ~{{ pi.peak_local_hour }}:00 local</span>
+      <span style="color:var(--muted)">
+        {% if htp > 0 %}in {{ '%.1f'|format(htp) }}h{% else %}{{ '%.1f'|format(-htp) }}h ago{% endif %}
+      </span>
+      <span style="color:var(--muted)">±{{ pi.peak_std_h }}h</span>
+    {% endif %}
+  </div>
+  {% endif %}
   <div class="time-to-close">
     {% if htc is none %}
       <span class="text-muted">Close time unknown</span>

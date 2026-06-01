@@ -14,7 +14,9 @@
       "resolution_source_name": "Wunderground",
       "resolution_source_url": "https://www.wunderground.com/history/daily/kr/incheon/RKSI",
       "wu_path": "kr/incheon/RKSI",
-      "anomaly": false
+      "anomaly": false,
+      "typical_peak_local_hour": 15,
+      "peak_std_h": 2.6
     },
     {
       "city": "Hong Kong",
@@ -31,7 +33,9 @@
       "resolution_source_url": "https://www.weather.gov.hk/en/cis/climat.htm",
       "source_station": "HKO",
       "anomaly": true,
-      "anomaly_note": "Settlement uses HKO Daily Extract; VHHH is only the fast METAR proxy."
+      "anomaly_note": "Settlement uses HKO Daily Extract; VHHH is only the fast METAR proxy.",
+      "typical_peak_local_hour": 14,
+      "peak_std_h": 1.5
     },
     {
       "city": "London",
@@ -47,7 +51,9 @@
       "resolution_source_name": "Wunderground",
       "resolution_source_url": "https://www.wunderground.com/history/daily/gb/london/EGLC",
       "wu_path": "gb/london/EGLC",
-      "anomaly": false
+      "anomaly": false,
+      "typical_peak_local_hour": 15,
+      "peak_std_h": 1.5
     },
     {
       "city": "Tokyo",
@@ -63,7 +69,9 @@
       "resolution_source_name": "Wunderground",
       "resolution_source_url": "https://www.wunderground.com/history/daily/jp/tokyo/RJTT",
       "wu_path": "jp/tokyo/RJTT",
-      "anomaly": false
+      "anomaly": false,
+      "typical_peak_local_hour": 13,
+      "peak_std_h": 1.6
     },
     {
       "city": "NYC",
@@ -79,7 +87,9 @@
       "resolution_source_name": "Wunderground",
       "resolution_source_url": "https://www.wunderground.com/history/daily/us/ny/new-york-city/KLGA",
       "wu_path": "us/ny/new-york-city/KLGA",
-      "anomaly": false
+      "anomaly": false,
+      "typical_peak_local_hour": 15,
+      "peak_std_h": 5.3
     },
     {
       "city": "Paris",
@@ -95,7 +105,9 @@
       "resolution_source_name": "Wunderground",
       "resolution_source_url": "https://www.wunderground.com/history/daily/fr/bonneuil-en-france/LFPB",
       "wu_path": "fr/bonneuil-en-france/LFPB",
-      "anomaly": false
+      "anomaly": false,
+      "typical_peak_local_hour": 15,
+      "peak_std_h": 1.7
     },
     {
       "city": "Beijing",
@@ -111,7 +123,9 @@
       "resolution_source_name": "Wunderground",
       "resolution_source_url": "https://www.wunderground.com/history/daily/cn/beijing/ZBAA",
       "wu_path": "cn/beijing/ZBAA",
-      "anomaly": false
+      "anomaly": false,
+      "typical_peak_local_hour": 15,
+      "peak_std_h": 2.9
     },
     {
       "city": "Miami",
@@ -127,7 +141,9 @@
       "resolution_source_name": "Wunderground",
       "resolution_source_url": "https://www.wunderground.com/history/daily/us/fl/miami/KMIA",
       "wu_path": "us/fl/miami/KMIA",
-      "anomaly": false
+      "anomaly": false,
+      "typical_peak_local_hour": 14,
+      "peak_std_h": 1.4
     },
     {
       "city": "Singapore",
@@ -143,7 +159,9 @@
       "resolution_source_name": "Wunderground",
       "resolution_source_url": "https://www.wunderground.com/history/daily/sg/singapore/WSSS",
       "wu_path": "sg/singapore/WSSS",
-      "anomaly": false
+      "anomaly": false,
+      "typical_peak_local_hour": 13,
+      "peak_std_h": 2.8
     },
     {
       "city": "Madrid",
@@ -159,7 +177,9 @@
       "resolution_source_name": "Wunderground",
       "resolution_source_url": "https://www.wunderground.com/history/daily/es/madrid/LEMD",
       "wu_path": "es/madrid/LEMD",
-      "anomaly": false
+      "anomaly": "Peak at 17:00 local (15:00 UTC) — 3h after 12:00 UTC close; effectively Type C for signal purposes.",
+      "typical_peak_local_hour": 17,
+      "peak_std_h": 1.5
     },
     {
       "city": "Moscow",
@@ -176,7 +196,9 @@
       "resolution_source_url": "https://www.weather.gov/wrh/timeseries?site=UUWW",
       "source_station": "UUWW",
       "anomaly": true,
-      "anomaly_note": "Settlement uses NOAA Vnukovo UUWW; older notes incorrectly used EFHK."
+      "anomaly_note": "Settlement uses NOAA Vnukovo UUWW; older notes incorrectly used EFHK.",
+      "typical_peak_local_hour": 15,
+      "peak_std_h": 2.5
     },
     {
       "city": "Munich",
@@ -192,7 +214,9 @@
       "resolution_source_name": "Wunderground",
       "resolution_source_url": "https://www.wunderground.com/history/daily/de/munich/EDDM",
       "wu_path": "de/munich/EDDM",
-      "anomaly": false
+      "anomaly": false,
+      "typical_peak_local_hour": 16,
+      "peak_std_h": 1.2
     },
     {
       "city": "Amsterdam",
@@ -208,7 +232,9 @@
       "resolution_source_name": "Wunderground",
       "resolution_source_url": "https://www.wunderground.com/history/daily/nl/schiphol/EHAM",
       "wu_path": "nl/schiphol/EHAM",
-      "anomaly": false
+      "anomaly": false,
+      "typical_peak_local_hour": 15,
+      "peak_std_h": 1.8
     },
     {
       "city": "Ankara",
@@ -224,7 +250,9 @@
       "resolution_source_name": "Wunderground",
       "resolution_source_url": "https://www.wunderground.com/history/daily/tr/%C3%A7ubuk/LTAC",
       "wu_path": "tr/%C3%A7ubuk/LTAC",
-      "anomaly": false
+      "anomaly": false,
+      "typical_peak_local_hour": 15,
+      "peak_std_h": 1.7
     },
     {
       "city": "Wellington",
@@ -240,7 +268,9 @@
       "resolution_source_name": "Wunderground",
       "resolution_source_url": "https://www.wunderground.com/history/daily/nz/wellington/NZWN",
       "wu_path": "nz/wellington/NZWN",
-      "anomaly": false
+      "anomaly": false,
+      "typical_peak_local_hour": 13,
+      "peak_std_h": 3.3
     },
     {
       "city": "Shenzhen",
@@ -256,7 +286,9 @@
       "resolution_source_name": "Wunderground",
       "resolution_source_url": "https://www.wunderground.com/history/daily/cn/shenzhen/ZGSZ",
       "wu_path": "cn/shenzhen/ZGSZ",
-      "anomaly": false
+      "anomaly": false,
+      "typical_peak_local_hour": 13,
+      "peak_std_h": 1.1
     },
     {
       "city": "Guangzhou",
@@ -272,7 +304,9 @@
       "resolution_source_name": "Wunderground",
       "resolution_source_url": "https://www.wunderground.com/history/daily/cn/guangzhou/ZGGG",
       "wu_path": "cn/guangzhou/ZGGG",
-      "anomaly": false
+      "anomaly": false,
+      "typical_peak_local_hour": 15,
+      "peak_std_h": 1.8
     }
   ]
 }
