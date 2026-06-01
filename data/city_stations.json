@@ -1,0 +1,21 @@
+{
+  "cities": [
+    {"city": "Seoul",      "slug": "seoul",      "station": "RKSI", "country": "KR", "wu_path": "kr/incheon/RKSI",           "anomaly": false},
+    {"city": "Hong Kong",  "slug": "hong-kong",  "station": "ZBAA", "country": "HK", "wu_path": "cn/beijing/ZBAA",           "anomaly": true,  "anomaly_note": "Resolves to Beijing Capital Airport — verify"},
+    {"city": "London",     "slug": "london",     "station": "EGLC", "country": "GB", "wu_path": "gb/london/EGLC",            "anomaly": false},
+    {"city": "Tokyo",      "slug": "tokyo",      "station": "RJTT", "country": "JP", "wu_path": "jp/tokyo/RJTT",             "anomaly": false},
+    {"city": "NYC",        "slug": "nyc",        "station": "KLGA", "country": "US", "wu_path": "us/ny/new-york-city/KLGA",  "anomaly": false},
+    {"city": "Paris",      "slug": "paris",      "station": "LFPB", "country": "FR", "wu_path": "fr/bonneuil-en-france/LFPB","anomaly": false},
+    {"city": "Beijing",    "slug": "beijing",    "station": "ZBAA", "country": "CN", "wu_path": "cn/beijing/ZBAA",           "anomaly": false},
+    {"city": "Miami",      "slug": "miami",      "station": "KMIA", "country": "US", "wu_path": "us/fl/miami/KMIA",          "anomaly": false},
+    {"city": "Singapore",  "slug": "singapore",  "station": "WSSS", "country": "SG", "wu_path": "sg/singapore/WSSS",         "anomaly": false},
+    {"city": "Madrid",     "slug": "madrid",     "station": "LEMD", "country": "ES", "wu_path": "es/madrid/LEMD",            "anomaly": false},
+    {"city": "Moscow",     "slug": "moscow",     "station": "EFHK", "country": "RU", "wu_path": "fi/vantaa/EFHK",            "anomaly": true,  "anomaly_note": "Resolves to Helsinki Vantaa Airport — verify"},
+    {"city": "Munich",     "slug": "munich",     "station": "EDDM", "country": "DE", "wu_path": "de/munich/EDDM",            "anomaly": false},
+    {"city": "Amsterdam",  "slug": "amsterdam",  "station": "EHAM", "country": "NL", "wu_path": "nl/schiphol/EHAM",          "anomaly": false},
+    {"city": "Ankara",     "slug": "ankara",     "station": "LTAC", "country": "TR", "wu_path": "tr/cubuk/LTAC",             "anomaly": false},
+    {"city": "Wellington", "slug": "wellington", "station": "NZWN", "country": "NZ", "wu_path": "nz/wellington/NZWN",        "anomaly": false},
+    {"city": "Shenzhen",   "slug": "shenzhen",   "station": "ZGSZ", "country": "CN", "wu_path": "cn/shenzhen/ZGSZ",          "anomaly": false},
+    {"city": "Guangzhou",  "slug": "guangzhou",  "station": "ZGGG", "country": "CN", "wu_path": "cn/guangzhou/ZGGG",         "anomaly": false}
+  ]
+}
