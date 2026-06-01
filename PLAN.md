@@ -215,6 +215,21 @@ inconsistencies. Required behavior:
   price gaps as a separate alert type (`alert_type = 'neg_risk_gap_cross_group'`) so
   they are distinguishable from within-group gaps.
 
+**NULL `neg_risk_market_id` guard**: if the CLOB API returns a partial response during
+discovery (network interruption, race condition), a market may be stored with
+`neg_risk_market_id = NULL`. SQLite groups all NULL values together when using
+`GROUP BY neg_risk_market_id` — meaning buckets from Seoul, Tokyo, and Paris with NULL
+group IDs would be treated as a single neg-risk group. The staircase check would run
+across unrelated markets and produce either spurious alerts or nonsense gaps.
+
+Required behavior:
+- All neg_risk_scanner queries must include `WHERE neg_risk_market_id IS NOT NULL`.
+- `discover_markets.py` must flag markets with `neg_risk_market_id IS NULL` by
+  logging a warning and inserting an `alerts` row with
+  `alert_type = 'incomplete_market_data'`. These markets must be retried on the
+  next discovery run until the field is populated.
+- A market with NULL `neg_risk_market_id` must not participate in scanner analysis.
+
 ---
 
 ### Source adapters required
@@ -259,9 +274,20 @@ aviation-grade instrument. Treat HK METAR readings as approximate — HKO settle
 will differ. All 17 in a single batch API call.
 **Key fields**:
 - `temp` → `temp_c`: current 2m temperature
-- `reportTime` → `observed_utc`: when the reading was taken at the station (stored separately from `fetched_utc`)
-- Running `daily_high_c` computed by `MAX(temp_c)` grouped by `(station, local_date)` — using the
-  station's local timezone, not UTC, to avoid midnight boundary errors for non-UTC cities
+- `reportTime` → `observed_utc`: when the reading was taken at the station (stored separately
+  from `fetched_utc`). Only store if `reportTime` carries an explicit UTC marker (`Z` or
+  `+00:00`). Reject and log records with no timezone suffix — see Timestamp Rule #6.
+- `daily_high_c`: `MAX(temp_c)` for the full local calendar day. **Treat as a query-time
+  aggregate, not a stored denormalized value.** Do not pre-compute and store `daily_high_c`
+  on individual rows — METAR stations occasionally issue corrections (COR METAR) with a
+  revised temperature for a previously reported `observed_utc`. If `daily_high_c` is
+  denormalized into each row and a correction arrives with a lower temperature, every prior
+  row retains the inflated max and cannot be recalculated without a full-table scan.
+  Anywhere the plan or schema shows `daily_high_c` as a stored column, interpret it as a
+  view or query alias for `MAX(temp_c) WHERE station=? AND local_date=?`, computed fresh
+  at query time. METAR corrections are handled automatically by the UNIQUE index on
+  `(station, source, observed_utc)` with `ON CONFLICT REPLACE` — the corrected `temp_c`
+  replaces the original, and the aggregate recalculates correctly on next query.
 
 ---
 
@@ -280,6 +306,32 @@ because it comes from the same institution as the METAR.
 **Horizon**: 30 hours (TAF format limitation — not full 48h)
 **Timestamps stored**: `issued_utc`, `valid_from_utc`, `valid_to_utc`, `fetched_utc`
 
+**TAF is not available for Q1 at T-48h**: TAF's 30h horizon means it cannot cover the
+settlement date at market open for markets discovered ≥30h before close. For a market
+discovered at T-48h, the TAF issued at that time covers only through T-18h — the settlement
+date is outside the TAF window entirely. TAF contributes to Q1 only when
+`(close_time_utc - first_seen_utc) <= 30h`. The plan describes 6 sources "48h ahead" —
+TAF is the exception: it is a closing-window source, not an opening-window source.
+
+**TX timestamp must map to correct settlement date**: The TAF TX field includes the time
+of the forecast maximum, e.g. `TX35/0606Z` (35°C at 06:00 UTC June 2). Before using TX
+for Q1, convert `tx_time_utc` to station local time and verify the resulting local date
+matches `settlement_date`. A 00z June 1 TAF for Seoul may carry a TX at 06:00 UTC June 2
+= 15:00 KST June 2 — which is the next settlement day's peak, not June 1's. Using this
+TX for the June 1 market is wrong. Add `forecast_local_date` (derived from `tx_time_utc`
++ station timezone) to `taf_forecasts`, and require Q1 TAF joins to filter on it:
+
+```sql
+-- Q1 TAF join (only valid when forecast_local_date = settlement_date)
+SELECT tf.tx_c, tf.tx_time_utc, tf.issued_utc, tf.fetched_utc
+FROM taf_forecasts tf
+JOIN weather_markets wm ON tf.station = wm.station
+                        AND tf.forecast_local_date = wm.settlement_date
+WHERE wm.condition_id = ?
+  AND tf.fetched_utc <= wm.first_seen_utc
+ORDER BY tf.fetched_utc DESC LIMIT 1
+```
+
 #### 2. ECMWF IFS — Direct from ECMWF Open Data
 **Source**: `data.ecmwf.int` via `ecmwf-opendata` Python library
 **What**: European Centre for Medium-Range Weather Forecasts IFS model. Gold standard globally.
@@ -291,6 +343,24 @@ on top of ECMWF's natural ~4–5h post-run time, yielding 6–8h total. Direct g
 **Format**: GRIB2, parsed with `cfgrib`. Extract 2m temp (`2t`) at steps +24h and +48h,
 then compute daily max across 3-hourly steps within each airport's local calendar day.
 **Timestamps stored**: `model_run_utc`, `fetched_utc`
+
+**Step selection — must use `game_start_time_utc`, not UTC date**: GRIB2 indexes data by
+forecast step (integer hours from model run time), not by local calendar date. "Daily max
+within the airport's local calendar day" requires extracting exactly the steps whose valid
+UTC timestamps fall within `[game_start_time_utc, game_start_time_utc + 24h)`. A naive
+approach that extracts "step +24h" as the daily high gives a single mid-morning point for
+Tokyo (00z +24h = 00:00 UTC = 09:00 JST), missing the afternoon peak entirely.
+
+Correct extraction per station:
+```python
+# window = [game_start_time_utc, game_start_time_utc + 24h)
+window_start = datetime.fromisoformat(game_start_time_utc)
+window_end = window_start + timedelta(hours=24)
+valid_steps = [s for s in grib_steps if window_start <= run_time + timedelta(hours=s) < window_end]
+daily_high_c = max(grib_2t[step][lat_idx, lon_idx] for step in valid_steps)
+```
+Store the first and last step used in `raw_payload_json` for audit. Never derive the step
+window from UTC calendar date — it will be wrong for every UTC+ station after 00:00 UTC.
 
 #### 3. GFS (Global Forecast System)
 **Source**: `api.open-meteo.com` — model `gfs_seamless`
@@ -659,6 +729,10 @@ CREATE TABLE alerts (
 );
 
 -- Normalized settlement-source observations (WU/HKO/NOAA/etc.)
+-- Multiple rows per (city, local_date, source_type) are expected — each fetch run inserts
+-- a new row. Sources occasionally publish corrections. settle_markets.py must always
+-- use ORDER BY fetched_utc DESC LIMIT 1 to get the most recent value, never SELECT *
+-- without ordering. The most recent fetch is authoritative.
 CREATE TABLE settlement_observations (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     condition_id    TEXT,
@@ -674,6 +748,10 @@ CREATE TABLE settlement_observations (
     fetched_utc     TEXT NOT NULL,
     raw_payload_json TEXT
 );
+-- No UNIQUE constraint — multiple fetches per city+date+source are intentional (corrections).
+-- Always query with ORDER BY fetched_utc DESC LIMIT 1 to get the authoritative value.
+CREATE INDEX IF NOT EXISTS ix_settle_obs_lookup
+    ON settlement_observations(city, local_date, source_type, fetched_utc);
 
 -- Final market resolution from Polymarket/UMA
 -- One row per condition_id (individual YES/NO market, not per event)
@@ -773,6 +851,20 @@ a model run is delayed (common with GFS). It should be labelled as an estimate i
 and never used as proof of which run was ingested. For ECMWF direct, the actual run time
 is in the GRIB2 metadata and should be extracted directly.
 
+**GFS delay detection**: GFS 00z runs are frequently delayed 1–3 hours. When delayed,
+open-meteo continues serving the prior 18z run. The estimated `model_run_utc` is stamped
+as `00z` but the data is actually from `18z` the prior day — a 6-hour-old run. This makes
+"Forecast revision momentum" analysis silently miss the 18z→00z revision: two rows appear
+with the same estimated `model_run_utc = 00z`, one being stale data.
+
+Detection rule: after each open-meteo fetch, compare
+`fetched_utc - timedelta(hours=configured_offset)` against the nominal run time. If the
+delta exceeds 2 hours, the model is likely still on the prior run. Log a `fetch_log` entry
+with `status='stale_run'` and set `model_run_is_estimated=1` with a note in
+`raw_payload_json`. This makes delayed runs visible in the audit trail. Analyses using
+`model_run_utc` for revision sequencing must filter `model_run_is_estimated=0` or treat
+open-meteo model run times as approximate ordering hints only.
+
 **`forecast_date` — must use station's local timezone, not UTC**
 
 open-meteo returns forecast dates in whatever timezone is requested. If no timezone is
@@ -791,6 +883,19 @@ were available at open?") because it bounds what this system could have known. I
 Polymarket ever exposes a true creation timestamp via the Gamma API, it should go in a
 separate field rather than overwriting `first_seen_utc`.
 
+**`first_seen_utc` must be stamped per-market, not per-batch**: the current implementation
+calls `_now()` once at the top of `discover()` and reuses that timestamp for every market
+in the run. A discovery run processing 561 markets takes ~8 minutes. A forecast fetched
+at `run_start + 3min` exists in `model_forecasts` but is excluded from Q1 for markets
+processed after it, because their `first_seen_utc` is 3 minutes earlier than when they
+were actually reached. The bias is systematic and largest for markets processed late in
+the loop order.
+
+Fix: call `_now()` immediately before each `_upsert_market()` call — not at the top of
+`discover()`. The `ON CONFLICT DO UPDATE SET first_seen_utc = COALESCE(...)` clause
+already preserves the original value on re-runs; the initial stamp just needs to reflect
+when that specific market was actually reached.
+
 ### Timestamp rules for all scripts
 
 1. Always use `datetime.now(timezone.utc)` — never `datetime.now()` (timezone-naive)
@@ -801,6 +906,14 @@ separate field rather than overwriting `first_seen_utc`.
 4. Always pass station timezone to open-meteo so response dates are local, not UTC
 5. Label estimated timestamps (e.g. `model_run_utc` from schedule offsets) in comments
    so future queries know not to treat them as authoritative
+6. Always validate that source timestamps carry explicit UTC encoding before storing as
+   `*_utc` fields. For METAR `reportTime`: accept only strings ending in `Z` or
+   `+00:00`, or documented-UTC strings from aviationweather.gov. If the suffix is absent,
+   reject the record and log a warning — do not store a potentially local-time value as
+   `observed_utc`. A Tokyo reading stored 9h off corrupts every downstream query that
+   uses `observed_utc` for time-of-day analysis or daily high attribution.
+7. Stamp `first_seen_utc` per-market at the moment of upsert, not once per batch run.
+   A shared batch timestamp biases Q1 for markets processed late in the loop.
 
 ---
 
@@ -945,6 +1058,16 @@ that assume "open = T-48h" will be misleading. Always display `first_seen_utc` a
 **Executability requirement**: every orderbook snapshot must include size/depth and raw
 book JSON. Midpoint-only analysis is insufficient for strategy testing because many apparent
 edges disappear at executable bid/ask size.
+
+**Empty books must still be recorded**: when the CLOB returns empty books post-close
+(`{"bids": [], "asks": []}` for both YES and NO tokens), `_snapshot_market` must still
+insert a row with all price fields NULL and `raw_book_json = '{"yes": {}, "no": {}}'`
+rather than returning None. The plan's claim "every 2-minute raw snapshot is stored" is
+false if empty-book responses produce None and are silently dropped. Post-close convergence
+analysis (Phase 2) requires seeing the exact timestamp when prices zeroed out — a gap
+between the last pre-close price snapshot and the next non-null reading is unacceptable.
+The distinction between "books were empty at T" and "we did not poll at T" must be
+preserved in the data.
 
 ### Safe query patterns
 
@@ -1226,6 +1349,43 @@ This will fail silently when fetches happen near UTC midnight for UTC+ stations.
       seconds of METAR insert, not deferred to next poll cycle. The effective last-actionable
       window for Type B cities ends at ~11:30 UTC (the :30 poller before close); deferring
       alert generation to the next scheduled run loses the final 30–60 minutes.
+
+**Open — correctness fixes (second audit round):**
+
+- [ ] **Fix `first_seen_utc` batch stamping**: move `_now()` call from top of `discover()`
+      to immediately before each `_upsert_market()` call, so each market gets the actual
+      time it was reached in the loop, not the batch start time.
+- [ ] **Add `forecast_local_date` to `taf_forecasts`**: compute from `tx_time_utc` +
+      station timezone at insert time. Require Q1 TAF joins to filter on this field,
+      not on `issued_utc` or `valid_from_utc`. Document that TAF is only a Q1 source
+      when `(close_time_utc - first_seen_utc) <= 30h`.
+- [ ] **Add `reportTime` UTC validation**: before storing `observed_utc` from METAR
+      `reportTime`, verify the string carries a `Z` or `+00:00` suffix. Reject and log
+      records without explicit UTC encoding rather than storing a potentially local-time
+      value (see Timestamp Rule #6).
+- [ ] **Clarify `daily_high_c` as query-time aggregate**: remove `daily_high_c` as a
+      stored column on `wx_observations` rows, or document explicitly that it must be
+      treated as `MAX(temp_c)` at query time. Ensure UNIQUE index uses
+      `ON CONFLICT REPLACE` so METAR corrections update `temp_c` in place, and the
+      aggregate recalculates correctly on next query.
+- [ ] **Add `ORDER BY fetched_utc DESC LIMIT 1` to all `settlement_observations` reads**
+      in `settle_markets.py`. Multiple rows per city+date+source are expected (each fetch
+      run inserts a new row; corrections arrive as new rows). The most recent fetch is
+      authoritative. Add `ix_settle_obs_lookup` index on
+      `(city, local_date, source_type, fetched_utc)`.
+- [ ] **Empty books → store NULL-price row**: change `_snapshot_market` to insert a row
+      with all price fields NULL and `raw_book_json = '{}'` when the CLOB returns empty
+      books, rather than returning None. Preserves the "we polled at T and books were
+      empty" record needed for post-close convergence analysis.
+- [ ] **Add ECMWF step-window derivation**: implement step selection using
+      `game_start_time_utc` as window start rather than UTC calendar date. Store first
+      and last step used in `raw_payload_json`.
+- [ ] **Add GFS stale-run detection**: after each open-meteo fetch, compare
+      `fetched_utc - configured_offset` against nominal run time. If delta > 2h, log
+      `status='stale_run'` in `fetch_log` and note in `raw_payload_json`.
+- [ ] **Add `neg_risk_market_id IS NOT NULL` guard to scanner**: all neg_risk_scanner
+      queries must exclude NULL group IDs. Discovery must flag NULL group ID markets
+      with `alert_type='incomplete_market_data'` and retry on next run.
 
 **Open — collection completeness:**
 
