@@ -30,7 +30,7 @@ authority. The authority is the per-market rules text and resolution source.
 | City        | Fast Proxy Station | Expected Source / Station      | Timezone         | Notes                         |
 |-------------|--------------------|--------------------------------|------------------|-------------------------------|
 | Seoul       | RKSI               | Incheon International          | Asia/Seoul       |                               |
-| Hong Kong   | VHHH               | Hong Kong Observatory (HKO)    | Asia/Hong_Kong   | Settlement: HKO Daily Extract. Fast proxy: VHHH (HK Int'l Airport, nearest ICAO, ~13km from HKO) |
+| Hong Kong   | VHHH               | Hong Kong Observatory (HKO)    | Asia/Hong_Kong   | Settlement: HKO Daily Extract. Fast proxy: VHHH (HK Int'l Airport, nearest ICAO, ~13km from HKO). **VHHH-HKO offset is unquantified**: VHHH reads a coastal airport microclimate; HKO reads an urban observatory. Systematic offsets of ±1–2°C are plausible. All HK obs_mismatch alerts are uncalibrated until ≥14 days of paired VHHH daily_high vs HKO settlement_observations are collected and the offset distribution is characterized. See Phase 3. |
 | London      | EGLC               | London City Airport            | Europe/London    |                               |
 | Tokyo       | RJTT               | Haneda Airport                 | Asia/Tokyo       |                               |
 | NYC         | KLGA               | LaGuardia Airport              | America/New_York | Fahrenheit range buckets       |
@@ -139,8 +139,13 @@ conversion requirement applies to all three cities where `bucket_unit != 'C'`.
 # In neg_risk_scanner.py obs_mismatch check:
 daily_high = obs["daily_high_c"]
 if market["bucket_unit"] == "F":
-    daily_high = daily_high * 9/5 + 32   # convert to F before comparing bucket thresholds
-# Then compare daily_high against lower_temp / upper_temp
+    # Convert C→F and apply WU-equivalent whole-degree rounding before bucket comparison.
+    # WU reports Fahrenheit to the nearest whole degree. Using the raw float (e.g. 95.72°F)
+    # may fire an alert for the 95–96°F bucket when WU will report 96°F and settlement
+    # lands on 95–96, or vice versa for values like 95.3°F which WU rounds to 95°F.
+    # Round to match what the settlement source will actually publish.
+    daily_high = round(daily_high * 9/5 + 32)
+# Then compare daily_high (now in bucket_unit, rounded to source precision) against lower_temp / upper_temp
 ```
 
 ### Implications for data collection and alerts
@@ -180,6 +185,23 @@ calendar day, written after local midnight) from final settlement (Polymarket/UM
 outcome), storing both. `settlement_value_proxy` comes from the named source adapter
 (WU/HKO/NOAA), not raw METAR — METAR is only the fast intraday signal.
 
+**`resolution_status` state machine** — valid states and the script responsible for each transition:
+
+| State | Meaning | Set by | Trigger |
+|-------|---------|--------|---------|
+| `NULL` | Not yet settled | — | Initial state after discovery |
+| `proxy_only` | Proxy value written; rounding rule may be unknown | `settle_markets.py` | `settlement_value_proxy` written after local midnight |
+| `confirmed` | Proxy outcome matches Polymarket/UMA final outcome | `settle_markets.py` (reconciliation pass) | `settlement_value_final` written AND `proxy_outcome` == `market_resolutions.resolved_outcome` |
+| `disputed` | Proxy and final disagree, OR multiple YES buckets, OR zero YES | `settle_markets.py` | `settlement_value_final` written AND outcomes differ; OR integrity check fails |
+
+`weather_markets.resolution_status` is the per-bucket status. `market_resolutions.resolution_status`
+is the per-market (YES/NO outcome) status. When they conflict, `market_resolutions` is
+authoritative — it holds the actual Polymarket/UMA decision. `weather_markets.resolution_status`
+reflects how well our proxy matched.
+
+No analysis script may treat `proxy_only` rows as `confirmed`. Transition from `proxy_only`
+to `confirmed` or `disputed` requires a completed Polymarket/UMA reconciliation run.
+
 ### All weather staircase markets are neg-risk markets
 
 Confirmed from CLOB API: `neg_risk: true` for every weather bucket market.
@@ -192,6 +214,23 @@ The same "above X°C YES ≈ sum of constituent bucket YES prices" constraint th
 applies to BTC staircase markets applies here. The neg-risk scanner for weather
 should use `neg_risk_market_id` to identify the group, then check the consistency
 constraint across all buckets in the group.
+
+**Formal constraint and gap threshold**: for each `above_eq` bucket at threshold T:
+
+```
+P_above(T)  = YES executable bid of the above_eq bucket at T
+P_sum(T)    = sum of YES executable asks for all exact/range buckets where lower_temp >= T
+gap(T)      = P_above(T) - P_sum(T)
+```
+
+If `gap(T) > 2¢`, flag as `neg_risk_gap`. Use executable prices (bid for the side you
+sell, ask for the side you buy), not midpoints — a 2¢ midpoint gap routinely disappears
+at executable size. The 2¢ threshold accounts for ~1¢ bid-ask on each leg of a 2-leg
+trade; gaps below this are within normal spread noise.
+
+If no `above_eq` bucket exists for a given staircase (some markets only have exact and
+range buckets), the constraint cannot be checked — log this as a scanner limitation in
+`alerts` with `alert_type = 'scanner_no_above_eq_bucket'`.
 
 **2. Capital efficiency for multi-leg trades**
 Polymarket's neg-risk collateral netting applies. Buying NO on multiple buckets
@@ -480,6 +519,16 @@ ORDER BY wm.city, wm.lower_temp
 - `weather_markets.settlement_source` — which source was used
 - `weather_markets.settled_at_utc`
 
+**Required post-condition — exactly one YES per city+date**: after running the Q2 CASE
+expression, `settle_markets.py` must assert that for each `(city, settlement_date)` group,
+exactly one `proxy_outcome = 'YES'` exists. Zero YES means the settlement value fell in a
+gap between buckets (bucket parse error or source value out of range). More than one YES
+means overlapping bucket definitions — for example, an `above_eq` threshold identical to
+an `exact` bucket threshold causes both to match at the boundary temperature. Both cases
+must set `resolution_status = 'disputed'` and insert an `alerts` row with
+`alert_type = 'settlement_integrity_error'`. Do not allow silently invalid settlement
+results to propagate into strategy analysis.
+
 ---
 
 ### Q3: Order book prices at open and at standard intervals to close?
@@ -559,6 +608,20 @@ Every fetch is wrapped in `with_retry()`:
 - Every attempt logged to `fetch_log` with exact UTC timestamp, duration in ms,
   status (`success` / `retry` / `failed`), records saved, and error message
 
+**Consecutive failure alerting**: logging to `fetch_log` is not enough — a silent 2-hour
+METAR outage during the Type B active window (08:00–12:00 UTC) leaves no observations for
+any European station and no operator notification. Required behavior:
+
+- After any source records 3 consecutive `status='failed'` cycles within a 2-hour window,
+  insert an `alerts` row: `alert_type='fetch_failure'`, `detail_json` containing source
+  name, station list, first failure time, and cycle count.
+- For METAR specifically, escalate if any failure cycle falls within 08:00–12:00 UTC
+  (Type B window) or 04:00–10:00 UTC (Type A window). These windows are when observation
+  gaps have the highest strategy impact.
+- Add `fetch_failure` to the valid `alert_type` enumeration alongside `neg_risk_gap`,
+  `obs_mismatch`, `forecast_divergence`, `convergence`, `incomplete_market_data`,
+  `settlement_integrity_error`, and `scanner_no_above_eq_bucket`.
+
 ---
 
 ## Database Schema
@@ -592,21 +655,29 @@ CREATE UNIQUE INDEX IF NOT EXISTS ix_wx_obs_unique
 CREATE INDEX IF NOT EXISTS ix_wx_station_date ON wx_observations(station, local_date);
 
 -- TAF aviation forecasts (TX/TN where available; only a subset of stations include temp)
+-- forecast_local_date: derived from tx_time_utc + station timezone at insert time.
+--   Required for Q1 TAF joins — tx_time_utc may fall on a different local date than
+--   issued_utc. Always join on forecast_local_date = settlement_date, not on issued_utc.
+-- TAF is only a Q1 source when (close_time_utc - first_seen_utc) <= 30h.
 CREATE TABLE taf_forecasts (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    station         TEXT NOT NULL,
-    city            TEXT NOT NULL,
-    issued_utc      TEXT NOT NULL,         -- when the TAF was issued
-    valid_from_utc  TEXT NOT NULL,
-    valid_to_utc    TEXT NOT NULL,
-    fetched_utc     TEXT NOT NULL,         -- when this system retrieved it
-    tx_c            REAL,                  -- forecast daily max
-    tx_time_utc     TEXT,                  -- when max is expected
-    tn_c            REAL,                  -- forecast daily min
-    tn_time_utc     TEXT,
-    raw_taf         TEXT,
-    raw_payload_json TEXT,
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    station             TEXT NOT NULL,
+    city                TEXT NOT NULL,
+    issued_utc          TEXT NOT NULL,         -- when the TAF was issued
+    valid_from_utc      TEXT NOT NULL,
+    valid_to_utc        TEXT NOT NULL,
+    fetched_utc         TEXT NOT NULL,         -- when this system retrieved it
+    tx_c                REAL,                  -- forecast daily max
+    tx_time_utc         TEXT,                  -- when max is expected (UTC)
+    forecast_local_date TEXT,                  -- tx_time_utc converted to station local date
+                                               -- (YYYY-MM-DD in station timezone — use for Q1 join)
+    tn_c                REAL,                  -- forecast daily min
+    tn_time_utc         TEXT,
+    raw_taf             TEXT,
+    raw_payload_json    TEXT,
     UNIQUE(station, issued_utc)
+    -- Use INSERT OR IGNORE: TAF data for the same station+issued_utc is deterministic;
+    -- if the row already exists (retry after partial failure), silently skip it.
 );
 
 -- NWP model forecasts (GFS, ECMWF direct, ICON, Météo-France, GEM)
@@ -626,6 +697,10 @@ CREATE TABLE model_forecasts (
     model_run_is_estimated INTEGER DEFAULT 1,
     raw_payload_json TEXT,
     UNIQUE(station, model, model_run_utc, forecast_date)
+    -- Use INSERT OR IGNORE: model data for the same station+model+run+date is deterministic.
+    -- Fetch retries after partial failures are safe — already-inserted rows are silently skipped
+    -- rather than erroring. A bare INSERT on conflict aborts the transaction and leaves
+    -- stations processed after the failure point without data.
 );
 
 -- Polymarket weather markets (refreshed daily by rules-first discovery)
@@ -681,6 +756,14 @@ CREATE TABLE weather_markets (
     resolution_status       TEXT,            -- 'proxy_only' | 'confirmed' | 'disputed'
     settled_at_utc          TEXT,            -- when settle_markets.py ran for this market
     active                  INTEGER DEFAULT 1,
+    -- active lifecycle: set to 1 on discovery; set to 0 by nightly cleanup when
+    -- close_time_utc < now - 48h. Nothing currently sets active=0 — discover_markets.py
+    -- sets active=1 unconditionally on every upsert and never visits past markets.
+    -- Without a cleanup step, active=1 is meaningless as a "currently live" indicator
+    -- after the first settlement day. Required: add a nightly job or end-of-discover_markets
+    -- pass that sets active=0 for all markets where close_time_utc < datetime('now','-48 hours').
+    -- Any query that uses active=1 as a live-market filter must also apply a date guard
+    -- (settlement_date >= date('now','-1 day')) until the cleanup step is implemented.
     created_at              TEXT DEFAULT (datetime('now'))
 );
 
@@ -916,6 +999,14 @@ when that specific market was actually reached.
    uses `observed_utc` for time-of-day analysis or daily high attribution.
 7. Stamp `first_seen_utc` per-market at the moment of upsert, not once per batch run.
    A shared batch timestamp biases Q1 for markets processed late in the loop.
+8. Guard `temp_window_start_utc` for NULL before using it as the `settlement_date`
+   derivation source. The CLOB `game_start_time` field may be absent for newly created
+   markets not yet fully propagated. A NULL value passed to `datetime.fromisoformat()`
+   raises `TypeError` and crashes discovery for all subsequent markets in the loop.
+   Fallback order: (1) parse date from event slug (always present, unambiguous);
+   (2) derive from `close_time_utc` using the NZDT-aware formula; (3) log a warning
+   and mark the market for retry. Never let a NULL `temp_window_start_utc` crash or
+   silently skip a market — it is a transient API state, not a permanent data problem.
 
 ---
 
@@ -1390,6 +1481,44 @@ This will fail silently when fetches happen near UTC midnight for UTC+ stations.
       queries must exclude NULL group IDs. Discovery must flag NULL group ID markets
       with `alert_type='incomplete_market_data'` and retry on next run.
 
+**Open — correctness fixes (third audit round):**
+
+- [ ] **Add `settle_markets.py` post-condition assertion**: after writing `proxy_outcome`,
+      assert exactly one YES exists per `(city, settlement_date)`. Zero or multiple YES
+      → set `resolution_status='disputed'` and insert `alert_type='settlement_integrity_error'`.
+- [ ] **Implement `active` flag lifecycle**: add a nightly cleanup pass (end of
+      `discover_markets.py` or a separate job) that sets `active=0` for all markets
+      where `close_time_utc < datetime('now','-48 hours')`. Until this exists, `active=1`
+      is not a reliable live-market indicator — all queries using it must also apply
+      a date guard.
+- [ ] **Add `temp_window_start_utc` NULL guard in `discover_markets.py`**: before
+      calling `datetime.fromisoformat(temp_window_start_utc)`, check for NULL.
+      Fallback: parse settlement date from event slug, or derive from `close_time_utc`.
+      Never let a NULL value crash or silently skip a market.
+- [ ] **Implement `resolution_status` state machine**: define transitions in code —
+      `settle_markets.py` sets `proxy_only` on first proxy write; a reconciliation pass
+      sets `confirmed` when `proxy_outcome == market_resolutions.resolved_outcome`, or
+      `disputed` when they differ. No current script performs this reconciliation.
+- [ ] **Specify `INSERT OR IGNORE` for `taf_forecasts` and `model_forecasts`**: bare
+      `INSERT` aborts on UNIQUE conflict, making fetch retries unsafe. Both tables need
+      `INSERT OR IGNORE` to make retries idempotent.
+- [ ] **Add `forecast_local_date` to `init_db.py`**: the column is now in the schema
+      DDL in PLAN.md but must be added to `init_db.py` and the migration dict so
+      `_migrate_existing_tables()` adds it to existing databases.
+- [ ] **Add C→F `round()` to obs_mismatch conversion**: apply
+      `round(daily_high_c * 9/5 + 32)` (not raw float) before comparing against
+      Fahrenheit bucket thresholds, to match WU's whole-degree rounding.
+- [ ] **Add consecutive fetch failure alerting**: after 3 failed METAR cycles in a
+      2-hour window, insert `alert_type='fetch_failure'`. Escalate if failure spans
+      Type A (04:00–10:00 UTC) or Type B (08:00–12:00 UTC) active windows.
+- [ ] **Add neg-risk gap formal specification to scanner**: implement the P_above vs
+      P_sum constraint with 2¢ threshold on executable prices, not midpoints. Handle
+      staircases with no `above_eq` bucket via `alert_type='scanner_no_above_eq_bucket'`.
+- [ ] **Schedule VHHH-HKO offset calibration**: after ≥14 days of data, compare
+      VHHH `daily_high` to HKO `settlement_observations.value` for the same local date.
+      Until calibrated, HK obs_mismatch alerts must carry an explicit "uncalibrated proxy"
+      caveat. Add this as a Phase 3 analysis task.
+
 **Open — collection completeness:**
 
 - [ ] **Run ICON, MF, GEM**: only GFS collected so far; 3 of 6 forecast models missing;
@@ -1411,6 +1540,10 @@ This will fail silently when fetches happen near UTC midnight for UTC+ stations.
 - [ ] Does model disagreement predict market mispricing?
 - [ ] How often do neg-risk gaps appear, and how long do they last?
 - [ ] Does settlement-source lag vs fast proxy data create a tradeable window?
+- [ ] Calibrate VHHH-HKO daily high offset: compare VHHH `MAX(temp_c)` vs HKO
+      `settlement_observations.value` across ≥14 settlement days; characterize the
+      offset distribution (mean, std, directionality). Apply correction factor to HK
+      obs_mismatch alerts once calibrated.
 
 ---
 
