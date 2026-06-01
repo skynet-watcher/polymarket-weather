@@ -6,20 +6,35 @@ Collect historical data for backtesting against past Polymarket weather markets.
 What this fetches per past date:
   1. Market definitions   — Gamma API (same as discover_markets.py, any past date)
   2. Price history        — CLOB prices-history per token (~hourly resolution)
-  3. Daily weather high   — open-meteo archive API (settlement proxy, years of history)
-  4. Settlement source    — NOAA Synoptic + HKO historical (same adapters as live)
-  5. Settlement outcome   — resolved market price snaps to 0.0 or 1.0
+  3. Settlement outcome   — resolved market price snaps to 0.0 or 1.0
+  4. Archive weather      — open-meteo archive daily max (universal settlement proxy)
 
-What this CANNOT provide:
-  - Full order book depth history (CLOB does not archive bid/ask depth)
-  - Historical NWP forecast runs at their original valid time
-  - Sub-hourly price resolution (prices-history is ~1 point/hour)
+For authoritative settlement temperatures, run backfill_settlement.py AFTER this
+script — it fetches IEM ASOS (WU-equivalent), HKO historical, and open-meteo archive
+with proper source labelling and cross-validation.
 
-Backtest coverage this enables:
-  Test 2  Market-open accuracy       — opening price vs settlement temperature
-  Test 6  Neg-risk gaps              — hourly price gaps (limited depth)
-  Test 7  Resolution source mismatch — open-meteo/NOAA vs Polymarket outcome
-  Test 8  Liquidity filter           — spread from hourly prices (approximate)
+CRITICAL LIMITATION — historical NWP forecast signals:
+  The open-meteo historical forecast API returns ANALYSIS values (what each model
+  computed as its best estimate for each day), NOT the forecast issued at T-48h.
+  Values are identical regardless of what start_date you pass — the API collapses
+  all lead times into a single analysis value per date.
+
+  TRUE historical NWP forecast data at specific lead times (T-48h, T-24h, etc.) is
+  NOT available from any free API for dates more than ~14 days ago:
+    - NOAA NOMADS: only keeps GFS GRIB2 files for ~2 weeks
+    - ECMWF MARS: paid subscription required
+    - Reforecast datasets: available but require large GRIB downloads and processing
+
+  Forecast signal backtesting (Tests 2, 3, 4, 5, 9) requires LIVE forward collection.
+  fetch_weather.py has been collecting real T-48h, T-24h, T-12h forecasts since launch.
+  Meaningful forecast signal analysis will be available within 2-3 weeks.
+
+What this backfill CAN support for backtesting:
+  Test 6  Neg-risk gaps              — hourly price history shows past gap windows
+  Test 7  Resolution source mismatch — archive proxy vs resolved Polymarket outcome
+  Test 8  Liquidity filter           — spread visible in hourly price data (approximate)
+  Test 2  Market-open accuracy       — market opening price vs settlement (limited: no
+                                       forecast to compare against, only market price)
 
 Usage:
     python scripts/backfill_history.py --days 30        # last 30 days
