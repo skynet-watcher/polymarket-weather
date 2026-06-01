@@ -315,6 +315,7 @@ HAVING mf.fetched_utc = MAX(mf.fetched_utc)
 SELECT wm.condition_id, wm.city, wm.settlement_date,
        wm.settlement_value_proxy,    -- source-adapted daily high
        wm.settlement_value_final,    -- Polymarket/UMA resolved outcome (if available)
+       wm.proxy_outcome,             -- YES/NO under the source-adapted proxy value
        wm.settlement_source,
        wm.settled_at_utc,
        wm.bucket_type, wm.lower_temp, wm.upper_temp, wm.bucket_unit,
@@ -340,6 +341,7 @@ ORDER BY wm.city, wm.lower_temp
 **Requires**:
 - `weather_markets.settlement_value_proxy` — source-adapted daily high written by `settle_markets.py`
 - `weather_markets.settlement_value_final` — Polymarket/UMA outcome, written when available
+- `weather_markets.proxy_outcome` — bucket-level YES/NO under `settlement_value_proxy`
 - `weather_markets.settlement_unit` — unit of the normalized settlement value
 - `weather_markets.bucket_unit` — unit used by bucket thresholds
 - `weather_markets.settlement_source` — which source was used
@@ -511,6 +513,7 @@ CREATE TABLE weather_markets (
     first_seen_utc          TEXT,            -- when discover_markets.py first found this market
     settlement_value_proxy  REAL,            -- Q2: normalized proxy source value in settlement_unit
     settlement_value_final  REAL,            -- Q2: final Polymarket/UMA resolved value/outcome
+    proxy_outcome           TEXT,            -- YES | NO under settlement_value_proxy
     settlement_source       TEXT,            -- which source was used for proxy settlement
     settlement_rounding_rule TEXT,           -- 'round' | 'floor' | 'ceiling' | unknown
                                              -- source reports 21.7C; bucket is integer 22C
@@ -615,8 +618,8 @@ polymarket-weather/
 │   │                           # assign snapshot_label; store size/depth/raw book
 │   ├── fetch_weather.py        # METAR + TAF + 5 NWP models; scheduled loop
 │   ├── fetch_settlement_sources.py # WU/HKO/NOAA source adapters
-│   ├── settle_markets.py       # Runs after source-specific finalization; writes
-│   │                           # settlement_value_proxy + final resolution
+│   ├── settle_markets.py       # Runs after source-specific finalization; applies
+│   │                           # settlement_value_proxy to bucket proxy_outcome
 │   └── neg_risk_scanner.py     # "above X°C" vs bucket sum + obs mismatch alerts
 ├── data/
 │   └── city_stations.json      # Enriched cache: city, slug, station, lat, lon,
@@ -1019,8 +1022,9 @@ This will fail silently when fetches happen near UTC midnight for UTC+ stations.
       store sizes/depth/spread/raw book JSON
 - [ ] Add `fetch_settlement_sources.py`: HKO and NOAA WRH adapters are built; WU and
       Polymarket/UMA final adapters still pending
-- [ ] `settle_markets.py`: write proxy and final settlement, apply unit conversion,
-      precision, bucket-aware logic, and final Polymarket/UMA reconciliation
+- [x] `settle_markets.py`: apply proxy settlement values to bucket-level `proxy_outcome`
+- [ ] Final Polymarket/UMA reconciliation: write `settlement_value_final`, apply final
+      bucket-aware outcome, and compare final vs proxy
 - [ ] Full scheduled loop running continuously
 
 ### Phase 2 — Gap detection

@@ -11,6 +11,7 @@ Start here:
 - `scripts/log_orderbooks.py` — collect CLOB order book snapshots
 - `scripts/fetch_weather.py` — collect weather observations from settlement sources
 - `scripts/fetch_settlement_sources.py` — collect source-of-record daily highs where adapters exist
+- `scripts/settle_markets.py` — apply proxy settlement values to bucket outcomes
 - `scripts/neg_risk_scanner.py` — scan temperature-market pricing gaps
 
 Older non-weather Polymarket work has been archived under:
