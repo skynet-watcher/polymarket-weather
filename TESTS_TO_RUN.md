@@ -570,6 +570,136 @@ Why it matters:
 
 This tells us whether the edge is actually weather insight or source-speed advantage.
 
+## Test 15 — Model Consensus vs Market Price: Return Analysis
+
+Hypothesis:
+
+When model consensus agrees on a temperature bucket that the market is pricing cheaply,
+the expected return may be strongly positive. When the market has already priced in the
+consensus, the edge may be zero or negative regardless of model accuracy.
+
+Core idea:
+
+For each settlement date and city, compute:
+1. The model consensus bucket (round the average predicted daily high to nearest integer)
+2. The executable ask price for that bucket
+3. The implied break-even accuracy (= ask price — the fraction of time models must be
+   right to break even)
+4. The expected value at different assumed model accuracy rates
+
+Key formulas:
+
+```
+# Single bucket
+shares       = stake / yes_ask
+gross_if_win = shares * 1.00
+net_profit   = gross_if_win - stake
+return_pct   = (net_profit / stake) * 100
+
+# Break-even accuracy
+break_even_accuracy = yes_ask          # must win this fraction of time to break even
+
+# Expected value at assumed accuracy p
+EV = p * (stake / yes_ask) - stake
+   = stake * (p / yes_ask - 1)
+
+# 3-bucket hedge (stake/3 on consensus-1, consensus, consensus+1)
+# If bucket_i wins: gross = (stake/3) / ask_i, net = gross - stake
+# If bucket_i loses: that leg pays $0
+```
+
+Market condition taxonomy (from live analysis 2026-06-01):
+
+Two distinct market states matter:
+
+**State A — Cheap consensus (ask < 25¢):**
+Models agree on a bucket the market is pricing low. Break-even is easily cleared.
+Examples:
+- Seoul 26°C at 2¢: need to be right >2% of the time. Return if right: +5,163%.
+- Hong Kong 31°C at 13¢: break-even >13%. Return if right: +669%.
+- Singapore 31°C at 20¢: break-even >20%. Return if right: +400%.
+Caution: cheap ask usually means models disagree with the market, not that the market
+is wrong. Seoul's 10°C model spread flags high uncertainty — investigate before trading.
+
+**State B — Expensive consensus (ask > 40¢):**
+Market has priced in the model view. Low return even if correct.
+Examples:
+- Tokyo 25°C at 50¢: need models right >50% of the time for any profit. EV likely negative.
+- Madrid 31°C at 51¢: similar — market already agrees with consensus.
+- Paris 22°C at 73¢: only +37% if right. A single-degree temperature miss loses everything.
+
+The 3-bucket hedge and asymmetric cold-side opportunity:
+
+When buying consensus ±1°C ($33 each, $100 total):
+- The warm (+1°) bucket is usually expensive — already bid up.
+- The cold (-1°) bucket is often very cheap — the market assumes warmer.
+- Being wrong to the cold side by 1° is frequently the most profitable miss.
+
+Example: Hong Kong — 3-bucket ($33 each on 30°C, 31°C, 32°C):
+- If 30°C wins (cold miss):  net +$2,464 (+2,464%)
+- If 31°C wins (consensus):  net  +$156 (+156%)
+- If 32°C wins (warm miss):  net   +$19 (+19%)
+
+Data needed:
+
+- `model_forecasts.high_c` and `model` — all 5 models for the settlement date
+- `ob_snapshots.yes_ask`, `yes_bid`, `yes_bid_size`, `yes_ask_size` — executable prices
+- `weather_markets.lower_temp`, `bucket_type`, `bucket_unit`
+- `market_resolutions.resolved_outcome` — ground truth for hit rate
+- `model_forecasts.peak_std_h` from `city_stations.json` — for model uncertainty context
+
+Analysis after data comes in:
+
+1. For each settled market, record: consensus bucket, ask at open (T-48h snapshot),
+   ask at T-24h, T-12h, T-close. Whether consensus resolved YES.
+2. Compute hit rate by city: what fraction of the time did the consensus bucket win?
+3. Compute hit rate by model spread bucket:
+   - Tight spread (≤1.5°C): consensus hit rate
+   - Medium spread (1.5–3°C): consensus hit rate
+   - Wide spread (>3°C): consensus hit rate
+4. Compute hit rate for the ±1 adjacent bucket (was the consensus off by exactly 1°C?).
+5. Compute actual EV per city for each strategy: single consensus, 3-bucket hedge,
+   cold-side-only, warm-side-only.
+6. Identify which cities have ask prices consistently below their historical hit rates
+   (structural mispricing vs informed market).
+
+Metrics:
+
+- Consensus hit rate by city and model spread band
+- Break-even accuracy vs realised accuracy (gap = edge)
+- EV per $100 by strategy and city
+- Hit rate for 3-bucket vs single bucket
+- Cold-bias vs warm-bias by city (does the market systematically over- or under-price one side?)
+- Model spread as predictor of hit rate (does tight consensus actually win more?)
+- Polymarket taker fees (0.2–0.5%) impact on net EV
+
+Trading interpretation:
+
+The analysis identifies two filters for a viable bet:
+1. Ask price < historical hit rate for that city (positive expected value)
+2. Model spread < 2°C (consensus is meaningful, not random)
+
+Markets passing both filters are candidates. Markets with expensive consensus buckets
+(ask > 40¢) require a hit rate above 40% to be +EV — unlikely unless you have
+significantly better information than the market.
+
+Watch item: cold-side bias. The market systematically prices the cold bucket cheaper
+than the warm bucket for most Asian cities (it assumes warmer afternoons). If models
+show the day will be cooler than the market expects, the cold bucket offers the best
+return for the least required accuracy.
+
+Pass/fail criteria:
+
+- Pass if realised consensus hit rate exceeds ask price for ≥3 cities after 30+ settlements.
+- Pass if 3-bucket hedge outperforms single-bucket after spread/fees for ≥2 cities.
+- Fail if hit rate is below ask price consistently — market is efficient for this signal.
+- Flag: any city where wide model spread (>5°C) and cheap ask co-occur — this is
+  uncertainty, not opportunity.
+
+Status: ⚠️ Partial — live prices available; settlement hit rate requires 2+ weeks data.
+
+---
+
 ## Research Layers
 
 Split analysis into three layers.
@@ -862,6 +992,7 @@ The original priority order below is updated to reflect current blocked status:
 | 12 | Dynamic Rebalancing (Test 5) | ⛔ Blocked | Requires settlement + multiple models |
 | 13 | Station Microclimate Reliability (Test 11) | ⛔ Blocked | Requires 2+ weeks + settlement |
 | 14 | Bucket Adjacency / Hedge Quality (Test 13) | ⛔ Blocked | Requires settlement data |
+| 15 | Model Consensus vs Market Price (Test 15) | ⚠️ Partial | Live prices + forecasts ready; hit rate needs ≥30 settled markets |
 
 Run tests in priority order. Do not advance to blocked tests before their prerequisites
 are met. See PREPRODUCTION_TESTS.md for system validation tests that must pass before
