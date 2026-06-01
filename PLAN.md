@@ -82,7 +82,7 @@ METAR high is a live signal.
 still pricing bucket X above 5¢
 
 ### Type B — At-peak settlement (European cities)
-**Cities**: London, Paris, Munich, Amsterdam, Madrid, Ankara, Helsinki(Moscow*)
+**Cities**: London, Paris, Munich, Amsterdam, Madrid, Ankara, Moscow (UUWW/Vnukovo, NOAA source)
 **Typical peak**: 13:00–16:00 local = 12:00–14:00 UTC
 **Trading closes**: 13:00–14:00 local = 12:00 UTC — right at or just before peak
 
@@ -118,7 +118,9 @@ high without any ability to react to observed temperatures.
 # Only fire obs_mismatch alerts when trading is open (before close_time_utc)
 # AND we are in or past the peak window for this city type
 
-TYPE_A_STATIONS = {'RKSI', 'RJTT', 'ZBAA', 'ZGSZ', 'ZGGG', 'WSSS'}  # peak 05-07 UTC
+TYPE_A_STATIONS = {'RKSI', 'RJTT', 'ZBAA', 'ZGSZ', 'ZGGG', 'WSSS', 'VHHH'}  # peak 05-07 UTC
+#                                                                         ^^^^
+#   HK proxy: VHHH (HK Int'l Airport ICAO) — fast proxy for HKO settlement source
 TYPE_B_STATIONS = {'EGLC', 'LFPB', 'EDDM', 'EHAM', 'LEMD', 'LTAC', 'UUWW'}  # peak 12-14 UTC
 TYPE_C_STATIONS = {'KLGA', 'KMIA', 'NZWN'}  # peak after trading closes
 
@@ -142,8 +144,10 @@ The exact resolution source is stored per market in `rules_source` and `resoluti
 Do not hard-code "Weather Underground" as universal — individual markets may specify NOAA, WU,
 a local met service, or another station.
 
-`settle_markets.py` separates proxy settlement (METAR daily high at close time) from final
-settlement (Polymarket/UMA resolved outcome), storing both.
+`settle_markets.py` separates proxy settlement (source-adapted daily high for the full local
+calendar day, written after local midnight) from final settlement (Polymarket/UMA resolved
+outcome), storing both. `settlement_value_proxy` comes from the named source adapter
+(WU/HKO/NOAA), not raw METAR — METAR is only the fast intraday signal.
 
 ### Source adapters required
 
@@ -181,7 +185,10 @@ No analysis should depend on manually maintained station assumptions when live r
 instrument family Weather Underground draws from, but METAR is real-time while WU publishes
 a final daily summary that may differ (rounding, QA, data cutoff time).
 **Frequency**: Every 30 minutes (stations update ~hourly; polling at 30 min catches every reading)
-**Coverage**: All 16 unique settlement stations in a single batch API call
+**Coverage**: All 17 configured settlement stations. HK proxy: VHHH (Hong Kong Int'l Airport
+ICAO, ~13km from HKO Observatory). HKO does not publish METAR; VHHH is the nearest
+aviation-grade instrument. Treat HK METAR readings as approximate — HKO settlement values
+will differ. All 17 in a single batch API call.
 **Key fields**:
 - `temp` → `temp_c`: current 2m temperature
 - `reportTime` → `observed_utc`: when the reading was taken at the station (stored separately from `fetched_utc`)
@@ -201,7 +208,7 @@ Fetched at each source's actual update cadence.
 Where TX/TN temperature fields are present, this is the highest-quality forecast available
 because it comes from the same institution as the METAR.
 **Frequency**: Every 6h (issued at 00, 06, 12, 18 UTC). Fetch 30 min after issuance.
-**Coverage**: All 16 stations fetched; only 5 include TX/TN temperature (RKSI, ZBAA, ZGGG, ZGSZ, LEMD).
+**Coverage**: All 17 configured stations fetched; only 5 include TX/TN temperature (RKSI, ZBAA, ZGGG, ZGSZ, LEMD).
 **Horizon**: 30 hours (TAF format limitation — not full 48h)
 **Timestamps stored**: `issued_utc`, `valid_from_utc`, `valid_to_utc`, `fetched_utc`
 
@@ -212,7 +219,7 @@ because it comes from the same institution as the METAR.
 **Why direct, not via open-meteo**: open-meteo mirrors ECMWF but adds 1–3h ingestion delay
 on top of ECMWF's natural ~4–5h post-run time, yielding 6–8h total. Direct gives ~4–5h.
 **Frequency**: 2× per day (00z and 12z runs). Fetch ~5h after run time (05:00 and 17:00 UTC).
-**Coverage**: Global — all 16 airports confirmed.
+**Coverage**: Global — all 17 configured airports confirmed.
 **Format**: GRIB2, parsed with `cfgrib`. Extract 2m temp (`2t`) at steps +24h and +48h,
 then compute daily max across 3-hourly steps within each airport's local calendar day.
 **Timestamps stored**: `model_run_utc`, `fetched_utc`
@@ -292,7 +299,10 @@ SELECT wm.condition_id, wm.city, wm.settlement_date,
          WHEN wm.bucket_type = 'exact'
               AND wm.settlement_value_proxy = wm.lower_temp THEN 'YES'
          WHEN wm.bucket_type = 'range'
-              AND wm.settlement_value_proxy BETWEEN wm.lower_temp AND wm.upper_temp THEN 'YES'
+              AND wm.settlement_value_proxy >= wm.lower_temp
+              AND wm.settlement_value_proxy <= wm.upper_temp THEN 'YES'
+              -- 'range' covers NYC/Miami Fahrenheit buckets (e.g. 68–69°F)
+              -- settlement_value_proxy must already be in bucket_unit (convert if needed)
          WHEN wm.bucket_type = 'above_eq'
               AND wm.settlement_value_proxy >= wm.lower_temp THEN 'YES'
          WHEN wm.bucket_type = 'below_eq'
@@ -538,12 +548,18 @@ CREATE TABLE settlement_observations (
 );
 
 -- Final market resolution from Polymarket/UMA
+-- One row per condition_id (individual YES/NO market, not per event)
+-- resolved_outcome: 'YES' or 'NO' (the winning outcome for this specific market)
+-- resolved_value:   the actual temperature that drove resolution, in resolved_unit
+-- Use alongside weather_markets (bucket_type, lower_temp, upper_temp) to reconstruct which
+-- temperature caused YES. Do not try to store "which bucket resolved" here — derive it by
+-- joining to weather_markets WHERE resolved_outcome='YES'.
 CREATE TABLE market_resolutions (
     condition_id     TEXT PRIMARY KEY,
-    resolved_outcome TEXT,
-    resolved_value   REAL,
-    resolved_unit    TEXT,
-    resolution_status TEXT,
+    resolved_outcome TEXT NOT NULL,          -- 'YES' | 'NO'
+    resolved_value   REAL,                   -- observed temp in resolved_unit (if known)
+    resolved_unit    TEXT,                   -- 'C' | 'F'
+    resolution_status TEXT,                  -- 'confirmed' | 'disputed' | 'pending'
     resolved_at_utc  TEXT,
     raw_payload_json TEXT
 );
@@ -683,15 +699,20 @@ converting `end_date_utc` to the station's local timezone and extracting the dat
 not by taking `DATE(end_date_utc)` in UTC. These differ for any station where
 UTC midnight and local midnight don't coincide, which is all non-UTC stations.
 
-**Rule**: `settlement_date` = `end_date_utc` converted to station timezone, date only.
-`close_time_utc` = settlement date + `T12:00:00Z` (confirmed universal for all weather markets).
-Store the derivation method in a comment in `discover_markets.py` so it cannot drift.
+**Rule**: `settlement_date` = the local calendar day being measured (midnight to midnight local).
+`close_time_utc` = confirmed universal `T12:00:00Z` on the named UTC date for all weather markets.
 
-Note: for cities where 12:00 UTC is before local midnight (Wellington), the settlement
-date local is the NEXT day's date. For `settlement_date` use the date of the local day
-being measured, which is `close_time_utc - 12h` converted to local date for all cities.
-Concretely: `settlement_date = (close_dt_utc - timedelta(hours=12)).astimezone(tz).date()`
-guarantees you get the measured day's date, not the settlement day's date.
+Canonical derivation (store as a comment in `discover_markets.py`):
+```python
+close_local = datetime.fromisoformat(close_time_utc).astimezone(ZoneInfo(station_tz))
+# Wellington edge case: 12:00 UTC = midnight NZST, which is the START of the next local day.
+# The day being measured is the one that just ended.
+if close_local.time() == datetime.time(0, 0):
+    settlement_date = (close_local.date() - timedelta(days=1)).isoformat()
+else:
+    settlement_date = close_local.date().isoformat()
+```
+This handles all cities including Wellington (UTC+12 → midnight) without special-casing each one.
 
 ### Q2: actual temperature resolution
 
@@ -706,23 +727,14 @@ Do NOT add `AND observed_utc <= close_time_utc`. Trading closure at 12:00 UTC do
 not end the temperature measurement window. Polymarket resolves after local midnight
 using the finalized full-day WU reading.
 
-The `local_date` to query:
-```python
-close_local = datetime.fromisoformat(close_time_utc).astimezone(ZoneInfo(tz))
-# Handle Wellington edge case: if close_time is exactly local midnight,
-# the measured day is the previous local date
-if close_local.time() == datetime.time(0, 0):
-    settlement_day = (close_local - timedelta(days=1)).date()
-else:
-    settlement_day = close_local.date()
-```
-
-Correct pattern:
+The `local_date` to query — use the canonical derivation above (same as `settlement_date`):
 ```python
 from zoneinfo import ZoneInfo
-tz = ZoneInfo(station_info["timezone"])
-close_dt = datetime.fromisoformat(close_time_utc).astimezone(tz)
-local_date = close_dt.date().isoformat()
+close_local = datetime.fromisoformat(close_time_utc).astimezone(ZoneInfo(station_tz))
+if close_local.time() == datetime.time(0, 0):           # Wellington edge case
+    settlement_day = (close_local.date() - timedelta(days=1)).isoformat()
+else:
+    settlement_day = close_local.date().isoformat()
 ```
 
 **The rounding problem**: METAR observations can report fractional degrees (e.g. 21.7°C).
@@ -867,8 +879,9 @@ Correct settle_markets.py fire times per city (~2h after local midnight):
 |------|---------------------|---------------------|
 | Seoul / Tokyo | 15:00 UTC same day | ~17:00 UTC same day |
 | Wellington | 12:00 UTC same day | ~14:00 UTC same day |
+| Hong Kong (HKO source) | 16:00 UTC same day | ~18:00 UTC same day |
 | Beijing / Shenzhen / Guangzhou / Singapore | 16:00 UTC same day | ~18:00 UTC same day |
-| Moscow / NOAA UUWW | 21:00 UTC same day | ~23:00 UTC same day |
+| Moscow (UUWW/NOAA) | 21:00 UTC same day | ~23:00 UTC same day |
 | Madrid | 22:00 UTC same day | ~00:00 UTC next day |
 | London | 23:00 UTC same day | ~01:00 UTC next day |
 | NYC / Miami | 04:00 UTC next day | ~06:00 UTC next day |
@@ -906,8 +919,8 @@ This will fail silently when fetches happen near UTC midnight for UTC+ stations.
       store METAR `reportTime` as `observed_utc`; compute `local_date` from that
       using station timezone; keep `fetched_utc` as when system retrieved it
 - [ ] **Fix daily high query**: use `(station, local_date)` not `DATE(ts_utc)`
-- [ ] **Determine Polymarket settlement time**: scrape one settled market's resolution
-      details to find exact UTC close time per city; hardcode if consistent
+- [x] **Polymarket settlement time confirmed**: 12:00 UTC universal for all weather markets
+      (scraped from settled Seoul/NYC markets: `end_date_iso = '2026-MM-DDT12:00:00Z'`)
 - [ ] **Fix open-meteo timezone**: pass `timezone=<station tz>` per model request
       so `forecast_date` is in station's local calendar, not UTC
 - [ ] **Run ICON, MF, GEM**: only GFS collected so far
