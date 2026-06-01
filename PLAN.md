@@ -482,6 +482,112 @@ separate field rather than overwriting `first_seen_utc`.
 
 ---
 
+## Analysis Query Correctness — End-to-End Trace
+
+The timestamps are only safe if the queries that use them are also consistent.
+Each analytical question was traced through its full join path to find failure modes.
+
+### Q1: forecast available at market open
+
+**The join**: `mf.forecast_date = wm.settlement_date`
+
+Both fields must be in the **same reference frame** — the station's local calendar date.
+
+`forecast_date` comes from open-meteo. open-meteo defaults to UTC if no timezone is
+passed. If the fetch happens at 23:30 UTC and Tokyo's settlement is June 2 local,
+open-meteo returns `forecast_date = '2026-06-01'` (UTC) while `settlement_date =
+'2026-06-02'` (Tokyo local). The JOIN returns zero rows. No error is raised.
+
+Fix: pass `timezone=<station tz>` per open-meteo request. Already in Phase 1 checklist.
+
+`settlement_date` comes from Polymarket's `end_date_utc`. It must be derived by
+converting `end_date_utc` to the station's local timezone and extracting the date —
+not by taking `DATE(end_date_utc)` in UTC. These differ for any station where
+UTC midnight and local midnight don't coincide, which is all non-UTC stations.
+
+**Rule**: `settlement_date` = `end_date_utc` converted to station timezone, date only.
+Store the derivation method in a comment in `discover_markets.py` so it cannot drift.
+
+### Q2: actual temperature resolution
+
+**The settlement lookup**: `MAX(temp_c) WHERE station=? AND local_date=?`
+
+`settle_markets.py` runs 30 minutes after `close_time_utc`. It must compute the
+`local_date` to query by converting `close_time_utc` to the station's timezone and
+extracting the local date from that. Using `dt.date.today()` is wrong — the server's
+UTC date at 04:30 UTC may match the local date by coincidence, but will fail for any
+station where the settlement UTC time crosses local midnight.
+
+Correct pattern:
+```python
+from zoneinfo import ZoneInfo
+tz = ZoneInfo(station_info["timezone"])
+close_dt = datetime.fromisoformat(close_time_utc).astimezone(tz)
+local_date = close_dt.date().isoformat()
+```
+
+**The rounding problem**: METAR observations can report fractional degrees (e.g. 21.7°C).
+Market buckets are whole integers. Polymarket applies a rounding rule at settlement —
+but that rule is not stored anywhere in this system. If METAR daily high = 21.7°C, the
+Q2 CASE expression with `bucket_type = 'exact' AND settlement_temp_c_proxy = 21.7` will
+never match any bucket. The resolved bucket will appear as NO for everything, which is wrong.
+
+Fix: add `settlement_rounding_rule` to `weather_markets` (e.g. `'round'` / `'floor'` /
+`'ceiling'`). Parse it from the market's rules text. Apply it when writing
+`settlement_temp_c_proxy` so the stored value is already rounded to the integer the
+market will use. Until this is known, flag proxy settlements as `resolution_status =
+'proxy_only'` and do not treat them as confirmed.
+
+### Q3: order book timeline
+
+**`hours_to_close` arithmetic**: computed as `(close_time_utc - ts_utc) / 3600`.
+Both are UTC strings. Subtraction is timezone-safe. ✓
+
+**`snapshot_label` assignment**: relative time comparison against `hours_to_close`
+thresholds. No calendar date involved. Timezone-safe. ✓
+
+**Dependency risk**: `close_time_utc` must be populated before `log_orderbooks.py`
+runs for a market. If `discover_markets.py` fails or hasn't run yet, `close_time_utc`
+is NULL. `hours_to_close` is NULL. No labels are assigned. All raw snapshots are still
+stored, but the standard interval view is empty for that market.
+
+Mitigation: `log_orderbooks.py` should log a warning per market where `close_time_utc`
+is NULL, and retry discovery before the next collection cycle.
+
+**"Open" label is first-seen, not true market creation**: the `open` label fires on
+the first snapshot within 5 minutes of `first_seen_utc`. If `discover_markets.py`
+first runs 36 hours before settlement (instead of 48h), the "open" snapshot is at T-36h,
+not T-48h. The data is honest — it reflects what we first observed — but queries
+that assume "open = T-48h" will be misleading. Always present `first_seen_utc` alongside
+`snapshot_label = 'open'` in analysis output so the actual discovery lag is visible.
+
+### Safe query patterns
+
+```sql
+-- ✓ Correct: compare UTC to UTC
+WHERE mf.fetched_utc <= wm.first_seen_utc
+
+-- ✓ Correct: compare local date to local date
+WHERE mf.forecast_date = wm.settlement_date   -- both derived in station timezone
+
+-- ✓ Correct: aggregate daily high by local date
+SELECT MAX(temp_c) FROM wx_observations
+WHERE station = ? AND local_date = ?           -- local_date pre-computed at insert
+
+-- ✗ Wrong: aggregate daily high by UTC date
+SELECT MAX(temp_c) FROM wx_observations
+WHERE station = ? AND DATE(ts_utc) = ?        -- will be wrong for non-UTC stations
+
+-- ✗ Wrong: derive local date at query time
+WHERE DATE(ts_utc) = DATE('now')               -- server UTC, not station local
+
+-- ✓ Correct: derive settlement local date
+-- In Python before querying:
+-- local_date = datetime.fromisoformat(close_time_utc).astimezone(ZoneInfo(tz)).date().isoformat()
+```
+
+---
+
 ## Phase Plan
 
 ### Phase 1 — Data collection (in progress)
