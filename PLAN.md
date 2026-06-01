@@ -93,6 +93,21 @@ the expected high is a last-minute signal before trading locks.
 **Active signal window**: 08:00–12:00 UTC (late morning, approaching peak)
 **Key alert**: obs_mismatch in final 2 hours of trading; prices still adjusting
 
+**Alert latency requirement**: The effective last-actionable obs_mismatch for Type B is
+not the reading observed just before 12:00 UTC — it is the last reading fetched AND
+processed before 12:00 UTC. With a 30-minute METAR poll cycle, any observation taken
+between 11:31 and 12:00 UTC is fetched at 12:00 and processed after trading closes.
+The true last-actionable window ends at ~11:30 UTC (the :30 poller), not 12:00 UTC.
+
+The alert pipeline must insert and fire obs_mismatch alerts within seconds of a new
+METAR row being committed — not at the next poll cycle. If alert generation is batched
+with the METAR fetch loop, the effective signal window shrinks to ~11:00 UTC (the
+last :00 poller that completes before 12:00). Any design that batches alerts with fetches
+loses the final 30–60 minutes of the most volatile window for Type B markets.
+
+**Required**: obs_mismatch alerts must be generated immediately on METAR insert (trigger-
+or callback-based), not deferred to the next scheduled run.
+
 ### Type C — Pre-peak settlement (NYC, Miami, Wellington)
 **Cities**: NYC, Miami, Wellington
 **Typical peak**: 14:00–15:00 local
@@ -111,6 +126,22 @@ high without any ability to react to observed temperatures.
 **Active signal window**: 06:00–12:00 UTC (morning observations before close)
 **Key alert**: forecast divergence before market close (cannot react to afternoon METAR)
 **No obs_mismatch alerts after 12:00 UTC** — trading is already closed
+
+**Unit conversion required for obs_mismatch**: METAR always reports temperature in Celsius
+(`daily_high_c`), but NYC and Miami bucket thresholds are stored in Fahrenheit (`bucket_unit='F'`).
+Any obs_mismatch comparison must convert `daily_high_c` to Fahrenheit before comparing against
+`lower_temp`/`upper_temp`. Comparing Celsius directly against Fahrenheit thresholds produces
+completely wrong alerts (e.g. 35°C compared against 93°F threshold — numerically 35 < 93, so
+the alert silently misses that 35°C = 95°F has already exceeded the 94°F bucket). This
+conversion requirement applies to all three cities where `bucket_unit != 'C'`.
+
+```python
+# In neg_risk_scanner.py obs_mismatch check:
+daily_high = obs["daily_high_c"]
+if market["bucket_unit"] == "F":
+    daily_high = daily_high * 9/5 + 32   # convert to F before comparing bucket thresholds
+# Then compare daily_high against lower_temp / upper_temp
+```
 
 ### Implications for data collection and alerts
 
@@ -169,6 +200,20 @@ Maximum loss = 1 × stake (you can only be in the wrong bucket once).
 
 Store `neg_risk_market_id` and `neg_risk_request_id` in `weather_markets` for
 group lookups in the scanner.
+
+**Multi-group guard**: the assumption "one `neg_risk_market_id` per city+date" may be
+violated if Polymarket adds new buckets mid-day via a separate UMA request, producing a
+second `neg_risk_market_id` for the same city+date. If the scanner only groups by
+`neg_risk_market_id`, it checks each group independently and misses cross-group price
+inconsistencies. Required behavior:
+
+- `discover_markets.py` must warn if more than one `neg_risk_market_id` is found for
+  the same `(city, settlement_date)`.
+- `neg_risk_scanner.py` must group by `(city, settlement_date)` first, then check for
+  multiple `neg_risk_market_id` values. If multiple exist, run the staircase consistency
+  check across ALL buckets for that city+date regardless of group ID. Flag inter-group
+  price gaps as a separate alert type (`alert_type = 'neg_risk_gap_cross_group'`) so
+  they are distinguishable from within-group gaps.
 
 ---
 
@@ -282,6 +327,24 @@ first finds a market. This is used as a proxy for market open. It is *not* neces
 the actual Polymarket creation timestamp — only use `first_seen_utc` for this purpose,
 and only upgrade to a different field name if a true creation timestamp is available from
 Polymarket/Gamma metadata.
+
+**Guard — market discovered after close**: if `first_seen_utc >= close_time_utc`, the market
+was not discovered until after trading locked. This happens when the scheduler is down for
+an extended period. `discover_markets.py` must detect this condition and immediately set
+`active=0` with a log warning. These markets must be excluded from Q1 analysis — their
+`first_seen_utc` is post-close, so `mf.fetched_utc <= wm.first_seen_utc` returns
+post-close forecasts that appear to be "available at open" but are not. The Q1 query
+already includes `AND wm.first_seen_utc < wm.close_time_utc` as a required filter (see
+safe query patterns).
+
+**Zero-row result handling**: Q1 may legitimately return zero rows for a model if the
+market was discovered before that model's forecast horizon extends to the settlement date.
+Example: market discovered at T-50h, but GFS only publishes 48h ahead — no GFS forecast
+existed for the settlement date at discovery time. This is expected and must be reported
+as "no T-48h forecast available" rather than treated as a collection failure. Distinguish
+the two cases using `horizon_hours` stored in `model_forecasts`: if
+`(close_time_utc - first_seen_utc) > model_horizon_hours`, the absence is a collection
+failure; if less, it is expected.
 
 **The query**:
 ```sql
@@ -767,17 +830,22 @@ UTC midnight and local midnight don't coincide, which is all non-UTC stations.
 **Rule**: `settlement_date` = the local calendar day being measured (midnight to midnight local).
 `close_time_utc` = confirmed universal `T12:00:00Z` on the named UTC date for all weather markets.
 
-Canonical derivation (store as a comment in `discover_markets.py`):
+Canonical derivation — use `game_start_time_utc`, not `close_time_utc` (store as a comment in `discover_markets.py`):
 ```python
-close_local = datetime.fromisoformat(close_time_utc).astimezone(ZoneInfo(station_tz))
-# Wellington edge case: 12:00 UTC = midnight NZST, which is the START of the next local day.
-# The day being measured is the one that just ended.
-if close_local.time() == datetime.time(0, 0):
-    settlement_date = (close_local.date() - timedelta(days=1)).isoformat()
-else:
-    settlement_date = close_local.date().isoformat()
+# PRIMARY: derive settlement_date from game_start_time_utc (local midnight = start of day)
+# game_start_time is always stored as the UTC moment of local midnight for the measured day.
+# Converting it to local time and extracting the date is unambiguous for all cities and DST states.
+from zoneinfo import ZoneInfo
+game_local = datetime.fromisoformat(game_start_time_utc).astimezone(ZoneInfo(station_tz))
+settlement_date = game_local.date().isoformat()  # always the local date being measured
 ```
-This handles all cities including Wellington (UTC+12 → midnight) without special-casing each one.
+
+Do NOT derive `settlement_date` from `close_time_utc`. The midnight-check workaround
+(`if close_local.time() == midnight: subtract 1 day`) fails during Wellington's daylight
+saving (NZDT, UTC+13): `12:00 UTC → 01:00 NZDT`, which is not midnight, so no subtraction
+occurs and the stored date is one day too late. `game_start_time_utc` is the correct and
+DST-safe primary source for settlement_date derivation — it is always the UTC instant of
+local midnight for the day being measured, regardless of timezone offset or DST state.
 
 ### Q2: actual temperature resolution
 
@@ -792,27 +860,41 @@ Do NOT add `AND observed_utc <= close_time_utc`. Trading closure at 12:00 UTC do
 not end the temperature measurement window. Polymarket resolves after local midnight
 using the finalized full-day reading from the market's named source.
 
-The `local_date` to query — use the canonical derivation above (same as `settlement_date`):
+The `local_date` to query — derive from `game_start_time_utc` (same as `settlement_date`):
 ```python
 from zoneinfo import ZoneInfo
-close_local = datetime.fromisoformat(close_time_utc).astimezone(ZoneInfo(station_tz))
-if close_local.time() == datetime.time(0, 0):           # Wellington edge case
-    settlement_day = (close_local.date() - timedelta(days=1)).isoformat()
-else:
-    settlement_day = close_local.date().isoformat()
+game_local = datetime.fromisoformat(game_start_time_utc).astimezone(ZoneInfo(station_tz))
+settlement_day = game_local.date().isoformat()  # DST-safe; correct for Wellington NZDT
 ```
 
-**The rounding problem**: METAR observations can report fractional degrees (e.g. 21.7°C).
-Market buckets are whole integers. Polymarket applies a rounding rule at settlement —
-but that rule is not stored anywhere in this system. If METAR daily high = 21.7°C, the
-Q2 CASE expression with `bucket_type = 'exact' AND settlement_value_proxy = 21.7` will
-never match any bucket. The resolved bucket will appear as NO for everything, which is wrong.
+**The rounding problem**: Settlement sources can report fractional degrees (e.g. WU 21.7°C,
+HKO 33.2°C). Market buckets are whole integers. Polymarket applies a rounding rule at
+settlement. If the source reports 21.7°C and the market resolves to whole-degree buckets,
+the Q2 CASE expression `bucket_type = 'exact' AND settlement_value_proxy = 21.7` will
+never match any bucket. Every bucket returns NO, which is wrong.
 
-Fix: add `settlement_rounding_rule` to `weather_markets` (e.g. `'round'` / `'floor'` /
-`'ceiling'`). Parse it from the market's rules text. Apply it when writing
-`settlement_value_proxy` so the stored value is already rounded to the integer the
-market will use. Until this is known, flag proxy settlements as `resolution_status =
-'proxy_only'` and do not treat them as confirmed.
+**Critical distinction — `settlement_rounding_rule` has two concepts, not one:**
+
+- `source_precision`: how the settlement source natively publishes its value (e.g. HKO
+  publishes one decimal place; WU may publish one decimal or whole degrees depending on
+  station). This is a property of the source.
+- `resolution_rounding_rule`: how Polymarket/UMA rounds the source value to compare against
+  integer bucket thresholds. This is a property of the market rules. Valid values: `'round'`
+  (standard half-up), `'floor'`, `'ceiling'`, `'unknown'`.
+
+These are stored in a single field `settlement_rounding_rule` today. This must be treated
+carefully: `'one_decimal'` (returned by `_rounding_rule()` for HKO) describes source
+precision, not the resolution rounding operation. For HKO markets that resolve to
+whole-degree buckets, the resolution operation is still `'round'` (or whatever the rules
+say). Do not use `'one_decimal'` as the rounding function — it will leave 33.2 unrounded
+and the Q2 comparison fails.
+
+Fix: parse and store both values separately, or at minimum ensure `settlement_rounding_rule`
+always stores the resolution operation (`'round'` / `'floor'` / `'ceiling'` / `'unknown'`),
+not the source's native precision. Apply the resolution rounding when writing
+`settlement_value_proxy` so the stored value is already in the form the market uses.
+Until the resolution rule is confirmed, flag proxy settlements as `resolution_status =
+'proxy_only'` and exclude them from strategy conclusions (see safe query patterns).
 
 **The unit/range problem**: Not all markets are integer Celsius exact buckets. US markets
 can use Fahrenheit range buckets (`68-69°F`), and Hong Kong rules can use one decimal
@@ -884,9 +966,39 @@ WHERE station = ? AND DATE(ts_utc) = ?        -- will be wrong for non-UTC stati
 -- ✗ Wrong: derive local date at query time
 WHERE DATE(ts_utc) = DATE('now')               -- server UTC, not station local
 
--- ✓ Correct: derive settlement local date
+-- ✓ Correct: derive settlement local date (DST-safe — use game_start_time_utc, not close_time_utc)
 -- In Python before querying:
--- local_date = datetime.fromisoformat(close_time_utc).astimezone(ZoneInfo(tz)).date().isoformat()
+-- game_local = datetime.fromisoformat(game_start_time_utc).astimezone(ZoneInfo(tz))
+-- local_date = game_local.date().isoformat()
+
+-- ✓ Correct: Q2 settlement query — exclude unconfirmed rounding
+-- Always gate on resolution_status before drawing strategy conclusions:
+SELECT * FROM weather_markets
+WHERE settlement_date = ?
+  AND settlement_value_proxy IS NOT NULL
+  AND resolution_status != 'proxy_only'   -- proxy_only = rounding rule unknown; may match wrong bucket
+ORDER BY city, lower_temp
+
+-- ✗ Wrong: use proxy_only rows as confirmed settlements
+-- settlement_value_proxy may be unrounded (e.g. 27.8 stored when market resolves at 28);
+-- Q2 CASE expression will return NO for every bucket — silent bad data, not an error.
+
+-- ✓ Correct: Q1 zero-row check — verify a result is expected before reporting a gap
+-- If first_seen_utc is within 48h of close_time_utc, some models may have no forecast yet.
+-- Check horizon_hours to distinguish "no forecast existed" from "collection failure":
+SELECT mf.model,
+       mf.high_c, mf.fetched_utc, mf.model_run_utc, mf.horizon_hours
+FROM model_forecasts mf
+JOIN weather_markets wm ON mf.station = wm.station
+                        AND mf.forecast_date = wm.settlement_date
+WHERE wm.condition_id = ?
+  AND mf.fetched_utc <= wm.first_seen_utc
+  AND wm.first_seen_utc < wm.close_time_utc   -- exclude markets discovered after close
+GROUP BY mf.model
+HAVING mf.fetched_utc = MAX(mf.fetched_utc)
+-- If zero rows: check whether (close_time_utc - first_seen_utc) < model's horizon_hours.
+-- If yes: gap is expected (market opened before this model's horizon). Not a collection failure.
+-- If no: gap is a collection failure — log it.
 ```
 
 ---
@@ -1079,11 +1191,18 @@ This will fail silently when fetches happen near UTC midnight for UTC+ stations.
       Ankara, Wellington, Shenzhen, Guangzhou, NYC, Miami) use WU as settlement source.
       Until this adapter exists, `settlement_value_proxy` is NULL and `proxy_outcome` is
       never populated for these cities. HKO and NOAA adapters are built; WU is the gap.
-- [ ] **Fix `settlement_date` stored as UTC loop date in `discover_markets.py`**: currently
-      `day.isoformat()` uses the UTC iteration date, not the station's local date. Correct
-      derivation per-city using `close_time_utc` + station timezone (Wellington edge case:
-      subtract 1 day when local close is exactly midnight). See "Analysis Query Correctness"
-      section for the canonical formula.
+- [ ] **Fix `settlement_date` derivation in `discover_markets.py`**: use `game_start_time_utc`
+      converted to station local timezone — NOT `day.isoformat()` (UTC loop date) and NOT
+      the `close_time_utc` midnight-check workaround (fails for Wellington NZDT, UTC+13,
+      where 12:00 UTC = 01:00 local, not midnight). See "Analysis Query Correctness" for
+      the canonical `game_start_time_utc` derivation.
+- [ ] **Fix `settlement_rounding_rule` conflation**: `_rounding_rule()` currently returns
+      `'one_decimal'` (source precision) but the schema expects the resolution rounding
+      operation (`'round'` / `'floor'` / `'ceiling'`). Fix `_rounding_rule()` to return
+      the resolution operation, not the source's native precision. Add a separate note
+      or field for source precision if needed. Without this fix, HKO markets with
+      `settlement_rounding_rule='one_decimal'` will store unrounded values in
+      `settlement_value_proxy` and every Q2 exact-bucket comparison will return NO.
 - [ ] **Fix `_snapshot_label` thresholds in `log_orderbooks.py`**: current thresholds are
       `[0.5, 1, 2, 4, 8, 12, 24]` — missing T-3h and T-6h, extra T-2h/T-4h/T-8h. Fix to
       `[0.5, 1, 3, 6, 12, 24]`.
@@ -1093,6 +1212,20 @@ This will fail silently when fetches happen near UTC midnight for UTC+ stations.
 - [ ] **Fix active market filter for Type C cities**: change `settlement_date >= date('now')`
       to `settlement_date >= date('now', '-1 day')` so NYC/Miami are not dropped from
       monitoring after UTC midnight when their local day (and temperature window) continues.
+- [ ] **Add post-close guard in `discover_markets.py`**: if `first_seen_utc >= close_time_utc`
+      at discovery time, immediately set `active=0` and log a warning. Prevents post-close
+      discoveries from polluting Q1 with misleading "pre-open" forecast rows.
+- [ ] **Add unit conversion to obs_mismatch in `neg_risk_scanner.py`**: convert `daily_high_c`
+      to `bucket_unit` before comparing against `lower_temp`/`upper_temp`. For NYC and Miami
+      (`bucket_unit='F'`), apply `daily_high_c * 9/5 + 32` before the threshold comparison.
+- [ ] **Add multi-group neg_risk guard**: `discover_markets.py` warns if multiple
+      `neg_risk_market_id` values found for same `(city, settlement_date)`;
+      `neg_risk_scanner.py` groups by city+date first, runs cross-group consistency check,
+      and uses `alert_type='neg_risk_gap_cross_group'` for inter-group gaps.
+- [ ] **Add real-time alert triggering for Type B obs_mismatch**: alerts must fire within
+      seconds of METAR insert, not deferred to next poll cycle. The effective last-actionable
+      window for Type B cities ends at ~11:30 UTC (the :30 poller before close); deferring
+      alert generation to the next scheduled run loses the final 30–60 minutes.
 
 **Open — collection completeness:**
 
