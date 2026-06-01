@@ -111,6 +111,83 @@ solid elsewhere.
 
 ---
 
+## Three Analytical Questions — Data Requirements
+
+### Q1: What are the 5 models predicting 48h out at market open?
+
+**What "market open" means**: Temperature markets appear on Polymarket ~48h before
+settlement. `discover_markets.py` records `first_seen_utc` the moment it first finds
+a market. That timestamp is the open.
+
+**The query**:
+For each model, find the most recent forecast that was *available* at open time:
+```sql
+SELECT mf.model, mf.high_c, mf.low_c, mf.fetched_utc, mf.model_run_utc
+FROM model_forecasts mf
+JOIN weather_markets wm ON mf.station = wm.station
+                        AND mf.forecast_date = wm.settlement_date
+WHERE wm.condition_id = ?
+  AND mf.fetched_utc <= wm.open_time_utc
+GROUP BY mf.model
+HAVING mf.fetched_utc = MAX(mf.fetched_utc)
+```
+
+**Requires**:
+- `weather_markets.open_time_utc` — set by `discover_markets.py` on first discovery
+- `weather_markets.settlement_date` — already planned
+- `model_forecasts` populated before market opens (TAF and models run ahead of time)
+
+---
+
+### Q2: What was the actual temperature resolution?
+
+**What "resolution" means**: The official METAR daily high at the settlement station
+on the settlement date, as recorded at or just after the market's close time.
+
+**The query**:
+```sql
+SELECT wm.condition_id, wm.city, wm.settlement_date,
+       wm.settlement_temp_c, wm.settled_at_utc,
+       wm.bucket_type, wm.temp_c,
+       CASE WHEN wm.settlement_temp_c = wm.temp_c THEN 'YES'
+            ELSE 'NO' END as resolved
+FROM weather_markets wm
+WHERE wm.settlement_date = ?
+ORDER BY wm.city, wm.temp_c
+```
+
+**Requires**:
+- `weather_markets.settlement_temp_c` — written by settlement job after close
+- `weather_markets.settled_at_utc` — when the settlement was recorded
+- A settlement job that runs shortly after `close_time_utc`, reads the final METAR
+  `daily_high_c` for that station, and writes it back to all markets for that city+date
+
+---
+
+### Q3: Order book prices at open and at standard intervals to close?
+
+**Standard intervals**: T-48h (open), T-24h, T-12h, T-6h, T-3h, T-1h, T-30min, T-close
+
+**The query**:
+```sql
+SELECT ob.snapshot_label, ob.ts_utc,
+       wm.temp_c, wm.bucket_type,
+       ob.yes_bid, ob.yes_ask, ob.yes_mid
+FROM ob_snapshots ob
+JOIN weather_markets wm ON ob.condition_id = wm.condition_id
+WHERE wm.city = ? AND wm.settlement_date = ?
+ORDER BY ob.ts_utc, wm.temp_c
+```
+
+**Requires**:
+- `ob_snapshots.snapshot_label` — tag applied at capture time:
+  `open` / `T-24h` / `T-12h` / `T-6h` / `T-3h` / `T-1h` / `T-30m` / `close`
+- `weather_markets.open_time_utc` and `close_time_utc` — to compute label offsets
+- `log_orderbooks.py` to apply labels: compute `hours_to_close` at each snapshot,
+  assign the nearest standard label if within 5 minutes of a threshold
+
+---
+
 ## Fetch Schedule
 
 | Source       | Runs/day | Fetch times (UTC)          | Delay after run | Horizon |
@@ -191,22 +268,29 @@ CREATE TABLE ob_snapshots (
     yes_ask         REAL,
     no_bid          REAL,
     no_ask          REAL,
-    yes_mid         REAL
+    yes_mid         REAL,
+    hours_to_close  REAL,              -- Q3: computed at capture time
+    snapshot_label  TEXT               -- Q3: 'open'|'T-24h'|'T-12h'|'T-6h'|
+                                       --     'T-3h'|'T-1h'|'T-30m'|'close'|NULL
 );
 
 -- Polymarket weather markets (refreshed daily)
 CREATE TABLE weather_markets (
-    condition_id    TEXT PRIMARY KEY,
-    city            TEXT NOT NULL,
-    station         TEXT NOT NULL,
-    settlement_date TEXT NOT NULL,
-    bucket_type     TEXT NOT NULL,    -- 'exact' | 'above_eq' | 'below_eq'
-    temp_c          REAL,
-    yes_token_id    TEXT,
-    no_token_id     TEXT,
-    question        TEXT,
-    active          INTEGER DEFAULT 1,
-    created_at      TEXT DEFAULT (datetime('now'))
+    condition_id        TEXT PRIMARY KEY,
+    city                TEXT NOT NULL,
+    station             TEXT NOT NULL,
+    settlement_date     TEXT NOT NULL,    -- YYYY-MM-DD
+    bucket_type         TEXT NOT NULL,    -- 'exact' | 'above_eq' | 'below_eq'
+    temp_c              REAL,             -- the temperature this bucket represents
+    yes_token_id        TEXT,
+    no_token_id         TEXT,
+    question            TEXT,
+    open_time_utc       TEXT,             -- Q1,Q3: first seen by discover_markets.py
+    close_time_utc      TEXT,             -- Q3: settlement UTC time (end_date_utc)
+    settlement_temp_c   REAL,             -- Q2: final METAR daily high at settlement
+    settled_at_utc      TEXT,             -- Q2: when settlement was recorded
+    active              INTEGER DEFAULT 1,
+    created_at          TEXT DEFAULT (datetime('now'))
 );
 
 -- Complete fetch audit trail
@@ -262,8 +346,13 @@ polymarket-weather/
 - [x] GFS, ICON, Météo-France, GEM via open-meteo — all 16 airports confirmed
 - [x] Retry logic + fetch_log with exact timestamps
 - [ ] ECMWF direct via `ecmwf-opendata` library (replace open-meteo ECMWF)
-- [ ] `discover_markets.py` condition ID extraction refined (too many false positives currently)
-- [ ] `log_orderbooks.py` connected to live weather_markets table
+- [ ] `discover_markets.py` refined: set `open_time_utc` on first discovery,
+      `close_time_utc` from Polymarket end_date, dedupe condition IDs properly
+- [ ] `log_orderbooks.py`: compute `hours_to_close` per snapshot, apply
+      `snapshot_label` at standard intervals (open/T-24h/.../close)
+- [ ] `settle_markets.py` (new): runs ~30 min after each city's `close_time_utc`,
+      reads final METAR `daily_high_c`, writes `settlement_temp_c` + `settled_at_utc`
+      back to all weather_markets rows for that city+date
 - [ ] Full loop running continuously (`fetch_weather.py --loop`)
 
 ### Phase 2 — Gap detection
