@@ -211,11 +211,11 @@ async def _do_fetch_metars(client: httpx.AsyncClient, conn: sqlite3.Connection) 
         raw_payload = json.dumps(obs, sort_keys=True)
         conn.execute("""
             INSERT OR IGNORE INTO wx_observations
-                (station, city, ts_utc, observed_utc, fetched_utc, local_date, local_hour,
-                 temp_c, daily_high_c, is_in_peak_window, source, raw_payload_json)
-            VALUES (?,?,?,?,?,?,?,?,NULL,?,'metar',?)
+                (station, city, observed_utc, fetched_utc, local_date, local_hour,
+                 temp_c, is_in_peak_window, source, raw_payload_json)
+            VALUES (?,?,?,?,?,?,?,?,'metar',?)
         """, (
-            sid, info["city"], fetched_utc, observed_utc, fetched_utc, local_date, local_hour,
+            sid, info["city"], observed_utc, fetched_utc, local_date, local_hour,
             temp_c, is_peak, raw_payload
         ))
         conn.commit()
@@ -382,7 +382,7 @@ async def _do_fetch_model(
             low  = lows[i]  if i < len(lows)  else None
             horizon = (dt.date.fromisoformat(d) - local_today).days * 24
             conn.execute("""
-                INSERT INTO model_forecasts
+                INSERT OR IGNORE INTO model_forecasts
                     (station, city, model, model_run_utc, fetched_utc,
                      forecast_date, horizon_hours, high_c, low_c, lat, lon,
                      model_run_is_estimated, raw_payload_json)
