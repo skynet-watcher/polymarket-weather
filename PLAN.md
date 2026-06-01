@@ -45,6 +45,72 @@ All station metadata (city, station, lat, lon, timezone, WU path, anomaly flags)
 
 ---
 
+## Market Typology — Peak vs Trading Close
+
+The relationship between the afternoon temperature peak and trading close is different
+for every city and fundamentally changes how each market works and what signals matter.
+
+### Type A — Post-peak settlement (Asian cities)
+**Cities**: Seoul, Tokyo, Beijing, Shenzhen, Guangzhou, Singapore
+**Typical peak**: 14:00–15:00 local = 05:00–07:00 UTC
+**Trading closes**: 20:00–21:00 local = 12:00 UTC — 5–7 hours after peak
+
+By the time trading closes, the afternoon high is already known and locked.
+The market should converge to the correct bucket during the afternoon as
+METAR readings rise toward and past the peak. Any pricing lag after a new
+METAR high is a live signal.
+
+**Active signal window**: 04:00–10:00 UTC (afternoon local across Asian stations)
+**Key alert**: obs_mismatch — METAR daily_high_c just exceeded bucket X; market
+still pricing bucket X above 5¢
+
+### Type B — At-peak settlement (European cities)
+**Cities**: London, Paris, Munich, Amsterdam, Madrid, Ankara, Helsinki(Moscow*)
+**Typical peak**: 13:00–16:00 local = 12:00–14:00 UTC
+**Trading closes**: 13:00–14:00 local = 12:00 UTC — right at or just before peak
+
+Trading closes exactly as temperatures are peaking. Market is most price-sensitive
+and volatile in the last 1–2 hours of trading. A late-morning METAR reading above
+the expected high is a last-minute signal before trading locks.
+
+**Active signal window**: 08:00–12:00 UTC (late morning, approaching peak)
+**Key alert**: obs_mismatch in final 2 hours of trading; prices still adjusting
+
+### Type C — Pre-peak settlement (NYC, Miami, Wellington)
+**Cities**: NYC, Miami, Wellington
+**Typical peak**: 14:00–15:00 local
+**Trading closes**: 
+- NYC/Miami: 08:00 EDT = 12:00 UTC — **7 hours before peak**
+- Wellington: midnight NZST = 12:00 UTC — **14 hours before peak**
+
+Trading locks before the hottest part of the day has happened.
+Settlement uses the full local calendar day high including the afternoon that occurs
+after trading has closed. METAR readings after 12:00 UTC are irrelevant to trading
+for these cities — nobody can act on them.
+
+These markets are **purely forecast-based**: traders must predict the final daily
+high without any ability to react to observed temperatures.
+
+**Active signal window**: 06:00–12:00 UTC (morning observations before close)
+**Key alert**: forecast divergence before market close (cannot react to afternoon METAR)
+**No obs_mismatch alerts after 12:00 UTC** — trading is already closed
+
+### Implications for data collection and alerts
+
+```python
+# Only fire obs_mismatch alerts when trading is open (before close_time_utc)
+# AND we are in or past the peak window for this city type
+
+TYPE_A_STATIONS = {'RKSI', 'RJTT', 'ZBAA', 'ZGSZ', 'ZGGG', 'WSSS'}  # peak 05-07 UTC
+TYPE_B_STATIONS = {'EGLC', 'LFPB', 'EDDM', 'EHAM', 'LEMD', 'LTAC', 'EFHK'}  # peak 12-14 UTC
+TYPE_C_STATIONS = {'KLGA', 'KMIA', 'NZWN'}  # peak after trading closes
+
+# For Type C: obs_mismatch is irrelevant after close_time_utc
+# Forecast divergence (Q1) is the only signal before close
+```
+
+---
+
 ## Settlement Model — Three Layers
 
 Do not treat any single data source as the definitive settlement truth. Three distinct layers exist:
@@ -264,8 +330,15 @@ CREATE TABLE wx_observations (
     observed_utc    TEXT,                  -- when the reading was taken at the station
     fetched_utc     TEXT NOT NULL,         -- when this system retrieved it
     local_date      TEXT NOT NULL,         -- YYYY-MM-DD in station's local timezone
+    local_hour      INTEGER,               -- 0-23 hour in station's local timezone
+                                           -- used to filter to peak window (Type A: 14-16,
+                                           -- Type B: 13-16, Type C: pre-close only)
     temp_c          REAL,
-    daily_high_c    REAL,                  -- MAX(temp_c) by (station, local_date)
+    daily_high_c    REAL,                  -- MAX(temp_c) for full local calendar day
+                                           -- (midnight to midnight local — NOT capped at
+                                           -- trading close; settlement = full day high)
+    is_in_peak_window INTEGER DEFAULT 0,  -- 1 if this reading is during the city's
+                                           -- typical afternoon peak hours (Type A/B/C aware)
     source          TEXT DEFAULT 'metar'
 );
 CREATE UNIQUE INDEX IF NOT EXISTS ix_wx_obs_unique
