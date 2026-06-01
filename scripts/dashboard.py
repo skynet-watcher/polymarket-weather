@@ -230,21 +230,32 @@ def get_city_detail(conn, city: str) -> dict:
         ORDER BY COALESCE(wm.lower_temp, wm.upper_temp) DESC
     """, (city, sdate)).fetchall()
 
-    # Forecasts at different fetched times (the standard intervals)
-    forecasts = conn.execute("""
-        SELECT model, high_c, low_c, fetched_utc, model_run_utc, forecast_date,
-               horizon_hours
+    # All forecast runs for this station+date — full history per model
+    all_forecasts = conn.execute("""
+        SELECT model, high_c, low_c, fetched_utc, model_run_utc,
+               forecast_date, horizon_hours, model_run_is_estimated
         FROM model_forecasts
         WHERE station=? AND forecast_date=?
-        ORDER BY model, fetched_utc DESC
+        ORDER BY model, fetched_utc ASC
     """, (station, sdate)).fetchall()
 
-    # Collapse to latest per model
+    # Latest value per model (for summary)
     latest_fcst: dict[str, dict] = {}
-    for f in forecasts:
+    all_fcst_by_model: dict[str, list] = {}
+    for f in all_forecasts:
         m = f["model"]
-        if m not in latest_fcst:
-            latest_fcst[m] = dict(f)
+        latest_fcst[m] = dict(f)
+        all_fcst_by_model.setdefault(m, []).append(dict(f))
+
+    # Also pull TAF if available
+    taf = conn.execute("""
+        SELECT tx_c, tn_c, tx_time_utc, issued_utc, fetched_utc
+        FROM taf_forecasts
+        WHERE station=? ORDER BY issued_utc DESC LIMIT 1
+    """, (station,)).fetchone()
+    if taf and taf["tx_c"]:
+        latest_fcst["TAF"] = dict(taf) | {"high_c": taf["tx_c"], "low_c": taf["tn_c"],
+                                            "model": "TAF"}
 
     # Price history for chart (top 4 buckets by current price)
     top_cids = [b["condition_id"] for b in buckets
@@ -309,6 +320,7 @@ def get_city_detail(conn, city: str) -> dict:
         "timezone":        _city_tz(conn, city),
         "buckets":         [dict(b) for b in buckets],
         "forecasts":       latest_fcst,
+        "all_fcst_by_model": all_fcst_by_model,
         "price_history":   price_history,
         "metar_path":      [dict(r) for r in metar_path],
         "metar_high":      metar_high,

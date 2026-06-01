@@ -253,37 +253,173 @@
   {# RIGHT COLUMN #}
   <div style="display:flex;flex-direction:column;gap:16px">
 
-    {# FORECAST TABLE #}
+    {# FORECAST PANEL #}
     <div class="card">
-      <div class="card-header">Model Forecasts</div>
-      <div style="padding:12px">
+      <div class="card-header">Model Forecasts — Predicted Daily High</div>
+      <div style="padding:14px">
+        {% set model_colors = {
+          'ecmwf_ifs025':       '#22c55e',
+          'gfs_seamless':       '#3b82f6',
+          'icon_seamless':      '#f59e0b',
+          'gem_seamless':       '#a78bfa',
+          'meteofrance_seamless':'#14b8a6',
+          'TAF':                '#f472b6'
+        } %}
+        {% set model_names = {
+          'ecmwf_ifs025':       'ECMWF IFS',
+          'gfs_seamless':       'GFS',
+          'icon_seamless':      'ICON',
+          'gem_seamless':       'GEM',
+          'meteofrance_seamless':'Météo-France',
+          'TAF':                'TAF'
+        } %}
+
         {% if d.forecasts %}
-        {% set model_colors = {'ecmwf_ifs025':'#22c55e','gfs_seamless':'#3b82f6','icon_seamless':'#f59e0b','gem_seamless':'#a78bfa','meteofrance_seamless':'#14b8a6'} %}
-        <table class="fcst-table">
-          <thead><tr>
-            <th>Model</th>
-            <th class="text-right">High</th>
-            <th class="text-right">Low</th>
-            <th class="text-right">Fetched</th>
-          </tr></thead>
-          <tbody>
-          {% for model, f in d.forecasts.items() %}
-          <tr>
-            <td>
-              <span class="model-dot" style="background:{{ model_colors.get(model,'#64748b') }}"></span>
-              {{ model.replace('_seamless','').replace('_ifs025',' IFS').upper() }}
-            </td>
-            <td class="text-right bold">{% if f.high_c %}{{ '%.1f'|format(f.high_c) }}°{% else %}—{% endif %}</td>
-            <td class="text-right text-muted">{% if f.low_c %}{{ '%.1f'|format(f.low_c) }}°{% else %}—{% endif %}</td>
-            <td class="text-right text-muted" style="font-size:11px">
-              {% if f.fetched_utc %}{{ f.fetched_utc[11:16] }} UTC{% endif %}
-            </td>
-          </tr>
-          {% endfor %}
-          </tbody>
-        </table>
+          {# Compute range for bar scaling #}
+          {% set highs = d.forecasts.values() | selectattr('high_c') | map(attribute='high_c') | list %}
+          {% set bkt_temps = d.buckets | selectattr('lower_temp') | map(attribute='lower_temp') | list %}
+          {% set all_vals = highs + bkt_temps %}
+          {% set chart_min = (all_vals | min - 2) | round(0,'floor') if all_vals else 15 %}
+          {% set chart_max = (all_vals | max + 2) | round(0,'ceil')  if all_vals else 40 %}
+          {% set chart_range = chart_max - chart_min %}
+
+          {# Market implied temperature from top bucket #}
+          {% set top_bkt = d.buckets | selectattr('yes_mid') | sort(attribute='yes_mid', reverse=true) | list %}
+          {% set mkt_implied = (top_bkt[0].lower_temp + top_bkt[0].upper_temp) / 2 if top_bkt and top_bkt[0].lower_temp and top_bkt[0].upper_temp else none %}
+
+          <div style="margin-bottom:14px">
+
+            {# Bucket range background markers #}
+            <div style="position:relative;margin-bottom:20px">
+              {# Temperature axis labels #}
+              <div style="display:flex;justify-content:space-between;font-size:10px;
+                           color:var(--muted);margin-bottom:4px;padding:0 2px">
+                <span>{{ chart_min|int }}°</span>
+                <span>{{ ((chart_min + chart_max)/2)|int }}°</span>
+                <span>{{ chart_max|int }}°{{ d.bucket_unit }}</span>
+              </div>
+
+              {# Bucket zone overlay #}
+              <div style="position:relative;height:8px;background:var(--bg);border-radius:4px;margin-bottom:16px;overflow:hidden">
+                {% for b in d.buckets | reverse %}
+                  {% if b.lower_temp and b.upper_temp and b.yes_mid and b.yes_mid > 0.05 %}
+                    {% set left_pct = ((b.lower_temp - chart_min) / chart_range * 100) | round(1) %}
+                    {% set w_pct    = ((b.upper_temp - b.lower_temp + 1) / chart_range * 100) | round(1) %}
+                    {% set alpha = (b.yes_mid * 0.8 + 0.1) %}
+                    <div style="position:absolute;left:{{ [left_pct,0]|max }}%;width:{{ [w_pct,2]|min if w_pct < 2 else w_pct }}%;
+                                  height:100%;background:rgba(34,197,94,{{ '%.2f'|format(alpha) }});
+                                  border-right:1px solid var(--bg)" title="{{ b.lower_temp }}–{{ b.upper_temp }}° @ {{ '%.0f'|format(b.yes_mid*100) }}¢"></div>
+                  {% endif %}
+                {% endfor %}
+              </div>
+              <div style="font-size:10px;color:var(--muted);margin-top:-12px;margin-bottom:12px">
+                ▲ market price distribution (green intensity = YES price)
+              </div>
+
+              {# One row per model #}
+              {% for model, f in d.forecasts.items() %}
+              {% if f.high_c %}
+              {% set pct = ((f.high_c - chart_min) / chart_range * 100) | round(1) %}
+              {% set color = model_colors.get(model, '#64748b') %}
+              {% set name  = model_names.get(model, model) %}
+              <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
+                {# Label #}
+                <div style="width:110px;font-size:12px;font-weight:600;color:{{ color }};
+                              flex-shrink:0;white-space:nowrap">
+                  {{ name }}
+                </div>
+                {# Bar track #}
+                <div style="flex:1;position:relative;height:22px;background:var(--bg);
+                              border-radius:4px;overflow:hidden">
+                  {# Fill to prediction #}
+                  <div style="position:absolute;left:0;top:0;bottom:0;width:{{ pct }}%;
+                                background:{{ color }}22;border-radius:4px;
+                                border-right:2px solid {{ color }}"></div>
+                  {# Value label on bar #}
+                  <div style="position:absolute;left:calc({{ pct }}% + 6px);top:50%;
+                                transform:translateY(-50%);font-size:12px;font-weight:700;
+                                color:{{ color }}">
+                    {{ '%.1f'|format(f.high_c) }}°
+                  </div>
+                </div>
+                {# Low temp #}
+                {% if f.low_c %}
+                <div style="width:40px;font-size:11px;color:var(--muted);text-align:right;flex-shrink:0">
+                  ↓{{ '%.0f'|format(f.low_c) }}°
+                </div>
+                {% endif %}
+              </div>
+              {% endif %}
+              {% endfor %}
+
+              {# Market implied line #}
+              {% if mkt_implied %}
+              {% set mkt_pct = ((mkt_implied - chart_min) / chart_range * 100) | round(1) %}
+              <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;margin-top:4px;
+                            padding-top:10px;border-top:1px solid var(--border)">
+                <div style="width:110px;font-size:12px;font-weight:600;color:var(--muted);flex-shrink:0">
+                  Market implied
+                </div>
+                <div style="flex:1;position:relative;height:22px;background:var(--bg);border-radius:4px;overflow:hidden">
+                  <div style="position:absolute;left:0;top:0;bottom:0;width:{{ mkt_pct }}%;
+                                background:#94a3b822;border-radius:4px;
+                                border-right:2px dashed #94a3b8"></div>
+                  <div style="position:absolute;left:calc({{ mkt_pct }}% + 6px);top:50%;
+                                transform:translateY(-50%);font-size:12px;font-weight:700;color:var(--muted)">
+                    {{ '%.1f'|format(mkt_implied) }}°
+                  </div>
+                </div>
+                <div style="width:40px"></div>
+              </div>
+              {% endif %}
+            </div>
+
+            {# Summary stats row #}
+            {% if highs %}
+            {% set spread = highs | max - highs | min %}
+            <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:4px">
+              <div style="background:var(--bg);border-radius:6px;padding:8px 12px;flex:1;min-width:80px">
+                <div style="font-size:10px;color:var(--muted);text-transform:uppercase">Consensus</div>
+                <div style="font-size:16px;font-weight:700;color:var(--blue)">
+                  {{ '%.1f'|format(highs|sum / highs|length) }}°
+                </div>
+              </div>
+              <div style="background:var(--bg);border-radius:6px;padding:8px 12px;flex:1;min-width:80px">
+                <div style="font-size:10px;color:var(--muted);text-transform:uppercase">Spread</div>
+                <div style="font-size:16px;font-weight:700;
+                              color:{% if spread > 3 %}var(--red){% elif spread > 1.5 %}var(--yellow){% else %}var(--green){% endif %}">
+                  {{ '%.1f'|format(spread) }}°
+                </div>
+              </div>
+              {% if mkt_implied %}
+              {% set consensus = highs|sum / highs|length %}
+              {% set edge = consensus - mkt_implied %}
+              <div style="background:var(--bg);border-radius:6px;padding:8px 12px;flex:1;min-width:80px">
+                <div style="font-size:10px;color:var(--muted);text-transform:uppercase">vs Market</div>
+                <div style="font-size:16px;font-weight:700;
+                              color:{% if edge|abs > 1 %}var(--yellow){% else %}var(--muted){% endif %}">
+                  {{ '%+.1f'|format(edge) }}°
+                </div>
+              </div>
+              {% endif %}
+            </div>
+            {% endif %}
+
+            {# Fetch time note #}
+            {% if d.forecasts %}
+            {% set first_f = d.forecasts.values() | list | first %}
+            <div style="margin-top:10px;font-size:11px;color:var(--muted)">
+              {% if first_f.fetched_utc %}Last updated {{ first_f.fetched_utc[11:16] }} UTC · {% endif %}
+              {{ d.forecasts | length }} model{% if d.forecasts|length != 1 %}s{% endif %} available
+              {% if d.forecasts|length < 5 %} · <span style="color:var(--yellow)">⚠ {{ 5 - d.forecasts|length }} not yet collecting</span>{% endif %}
+            </div>
+            {% endif %}
+
+          </div>
         {% else %}
-        <div style="color:var(--muted);font-size:13px;padding:8px">No forecast data yet — fetch_weather.py collecting</div>
+        <div style="color:var(--muted);font-size:13px;padding:8px">
+          No forecast data yet — fetch_weather.py collecting (check /health)
+        </div>
         {% endif %}
       </div>
     </div>
