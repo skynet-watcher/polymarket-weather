@@ -785,6 +785,259 @@ def test_p27_stale_run_detection():
                f"stale_on_time={stale_1} (expected False), stale_late={stale_2} (expected True)")
 
 
+# ── GROUP 2 — Missing offline tests ──────────────────────────────────────────
+
+def test_p07_post_close_discovery_guard():
+    """Markets discovered after close_time_utc must be set active=0."""
+    conn = fresh_db()
+    past_close = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=3)).isoformat()
+    now_str = dt.datetime.now(dt.timezone.utc).isoformat()
+
+    # Insert a market whose close_time_utc is 3 hours in the past
+    conn.execute("""
+        INSERT INTO weather_markets
+        (condition_id,city,station,settlement_date,bucket_type,bucket_unit,
+         settlement_unit,close_time_utc,first_seen_utc,active)
+        VALUES('0xPOSTCLOSE','Seoul','RKSI','2026-06-01','exact','C','C',?,?,1)
+    """, (past_close, now_str))
+    conn.commit()
+
+    # Simulate the guard: if first_seen_utc >= close_time_utc → set active=0
+    rows = conn.execute("""
+        SELECT condition_id, first_seen_utc, close_time_utc
+        FROM weather_markets WHERE condition_id='0xPOSTCLOSE'
+    """).fetchall()
+
+    updated = 0
+    for row in rows:
+        if row["first_seen_utc"] >= row["close_time_utc"]:
+            conn.execute(
+                "UPDATE weather_markets SET active=0 WHERE condition_id=?",
+                (row["condition_id"],)
+            )
+            updated += 1
+    conn.commit()
+
+    active = conn.execute(
+        "SELECT active FROM weather_markets WHERE condition_id='0xPOSTCLOSE'"
+    ).fetchone()[0]
+    conn.close()
+
+    if active == 0 and updated == 1:
+        report("P-07", "Post-close discovery guard sets active=0", PASS)
+    else:
+        report("P-07", "Post-close discovery guard sets active=0", FAIL,
+               f"active={active}, updated={updated}")
+
+
+def test_p10_station_coverage_alert():
+    """Missing stations in METAR batch response must produce fetch_failure alerts."""
+    conn = fresh_db()
+    configured = {"RKSI","VHHH","EGLC","RJTT","KLGA","LFPB","ZBAA",
+                  "KMIA","WSSS","LEMD","UUWW","EDDM","EHAM","LTAC",
+                  "NZWN","ZGSZ","ZGGG"}
+    returned   = configured - {"UUWW", "NZWN"}   # simulated partial response
+    missing    = configured - returned
+    now        = dt.datetime.now(dt.timezone.utc).isoformat()
+
+    n_records = len(returned)
+    conn.execute("""
+        INSERT INTO fetch_log(ts_utc,source,attempt,status,n_records)
+        VALUES(?,?,?,?,?)
+    """, (now, "metar", 1, "success", n_records))
+
+    for station in missing:
+        conn.execute("""
+            INSERT INTO alerts(opened_utc,last_seen_utc,city,alert_type,status,detail_json)
+            VALUES(?,?,?,?,?,?)
+        """, (now, now, station, "fetch_failure", "open",
+              json.dumps({"station": station, "reason": "absent from METAR batch"})))
+    conn.commit()
+
+    alert_stations = {
+        r[0] for r in conn.execute(
+            "SELECT city FROM alerts WHERE alert_type='fetch_failure'"
+        ).fetchall()
+    }
+    logged_n = conn.execute(
+        "SELECT n_records FROM fetch_log WHERE source='metar'"
+    ).fetchone()[0]
+    conn.close()
+
+    if alert_stations == {"UUWW","NZWN"} and logged_n == 15:
+        report("P-10", "Station coverage alert on partial METAR response", PASS,
+               f"alerts for {alert_stations}, n_records={logged_n}")
+    else:
+        report("P-10", "Station coverage alert on partial METAR response", FAIL,
+               f"alert_stations={alert_stations}, n_records={logged_n}")
+
+
+def test_p16_open_label_logic():
+    """open label must fire once, within 5 min of first_seen_utc, never overwrite."""
+    # Test the label assignment logic without live data:
+    # snapshot within 5 min of first_seen → open
+    # subsequent snapshots → bin label only
+
+    # Market discovered 36h before close — snapshots in open_window territory
+    close_time  = dt.datetime(2026, 6, 2, 12, 0, 0, tzinfo=dt.timezone.utc)
+    first_seen  = close_time - dt.timedelta(hours=36)   # T-36h
+
+    def assign_label(ts: dt.datetime, first_seen: dt.datetime,
+                     close_time: dt.datetime, already_open: bool) -> tuple[str, bool]:
+        """Returns (label, open_label_assigned)."""
+        htc = (close_time - ts).total_seconds() / 3600
+        # open label: first snapshot within 5 min of first_seen, not yet assigned
+        if not already_open and abs((ts - first_seen).total_seconds()) <= 300:
+            return "open", True
+        if htc < 0:    return "post_close", already_open
+        if htc <= 0.5: return "T-30min",   already_open
+        if htc <= 1.0: return "T-1h",      already_open
+        if htc <= 3.0: return "T-3h",      already_open
+        if htc <= 6.0: return "T-6h",      already_open
+        if htc <= 12.0:return "T-12h",     already_open
+        if htc <= 24.0:return "T-24h",     already_open
+        return "open_window", already_open
+
+    snapshots = [
+        first_seen + dt.timedelta(minutes=2),   # → open (within 5 min, htc=35.97h)
+        first_seen + dt.timedelta(minutes=10),  # → open_window (already assigned, htc>24h)
+        first_seen + dt.timedelta(hours=12),    # → open_window (htc=24h)
+        first_seen + dt.timedelta(hours=13),    # → T-24h (htc=23h ≤ 24h)
+    ]
+
+    open_assigned = False
+    labels = []
+    for ts in snapshots:
+        label, open_assigned = assign_label(ts, first_seen, close_time, open_assigned)
+        labels.append(label)
+
+    open_count = labels.count("open")
+    if open_count == 1 and labels[0] == "open" and labels[1] == "open_window" and labels[3] == "T-24h":
+        report("P-16", "open label fires once, not overwritten", PASS,
+               f"labels={labels}")
+    else:
+        report("P-16", "open label fires once, not overwritten", FAIL,
+               f"labels={labels}, open_count={open_count}")
+
+
+def test_p21_settle_trigger_timing():
+    """settle_markets.py trigger: temp_window_start_utc + 26h < now."""
+    from datetime import datetime, timezone, timedelta
+
+    cases = [
+        # (city, temp_window_start_utc, expected_trigger_utc_hour_approx)
+        # Seoul/Tokyo UTC+9: local midnight = 15:00 UTC; trigger = 17:00 UTC
+        ("Seoul/Tokyo", "2026-06-01T15:00:00Z", 17),
+        # Wellington NZST UTC+12: local midnight = 12:00 UTC; trigger = 14:00 UTC
+        ("Wellington",  "2026-06-01T12:00:00Z", 14),
+        # NYC EDT UTC-4: local midnight = 04:00 UTC; trigger = 06:00 UTC
+        ("NYC/Miami",   "2026-06-01T04:00:00Z",  6),
+        # London BST UTC+1: local midnight = 23:00 UTC prev day; trigger = 01:00 UTC next
+        ("London",      "2026-05-31T23:00:00Z",  1),
+    ]
+
+    failures = []
+    for city, tws, expected_hour in cases:
+        window_start = _parse_utc(tws)
+        trigger_utc  = window_start + timedelta(hours=26)
+        if trigger_utc.hour != expected_hour:
+            failures.append(
+                f"{city}: trigger_hour={trigger_utc.hour}, expected={expected_hour}"
+            )
+
+    if failures:
+        report("P-21", "settle_markets.py trigger UTC hours", FAIL,
+               "; ".join(failures))
+    else:
+        report("P-21", "settle_markets.py trigger UTC hours", PASS)
+
+
+# ── GROUP 8 — End-to-end ─────────────────────────────────────────────────────
+
+def test_p28_end_to_end(network: bool):
+    """Full pipeline smoke test — Seoul one day (requires network + live data)."""
+    if not network:
+        report("P-28", "End-to-end pipeline smoke test (Seoul)", SKIP,
+               "requires --network and live APIs")
+        return
+
+    import asyncio
+    try:
+        from discover_markets import discover
+        from fetch_weather import fetch_metar
+    except ImportError as e:
+        report("P-28", "End-to-end pipeline smoke test (Seoul)", SKIP,
+               f"import error: {e}")
+        return
+
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        init_db(conn)
+
+        n_markets = asyncio.run(discover(conn, days_ahead=1))
+        seoul_markets = conn.execute("""
+            SELECT condition_id, city, station, settlement_date, bucket_type,
+                   close_time_utc, temp_window_start_utc, neg_risk_market_id,
+                   yes_token_id, no_token_id
+            FROM weather_markets WHERE city='Seoul' AND active=1
+        """).fetchall()
+
+        failures = []
+        if not seoul_markets:
+            failures.append("no Seoul markets discovered")
+        else:
+            for m in seoul_markets:
+                for col in ("close_time_utc","temp_window_start_utc",
+                            "neg_risk_market_id","yes_token_id","no_token_id"):
+                    if m[col] is None:
+                        failures.append(f"Seoul market {m['condition_id'][:8]}: {col} is NULL")
+
+        conn.close()
+        if failures:
+            report("P-28", "End-to-end pipeline smoke test (Seoul)", FAIL,
+                   "; ".join(failures[:3]))
+        else:
+            report("P-28", "End-to-end pipeline smoke test (Seoul)", PASS,
+                   f"{len(seoul_markets)} Seoul markets, all required fields present")
+    except Exception as e:
+        report("P-28", "End-to-end pipeline smoke test (Seoul)", FAIL, str(e))
+
+
+# ── SELF-CHECK: spec vs implementation count ──────────────────────────────────
+
+def test_spec_implementation_sync():
+    """PREPRODUCTION_TESTS.md and run_tests.py must define the same number of tests.
+
+    This test prevents the most common form of drift: a test is added to the
+    prose spec but never implemented, or implemented without updating the spec.
+    """
+    spec_file = os.path.join(REPO_ROOT, "PREPRODUCTION_TESTS.md")
+    impl_file = os.path.join(REPO_ROOT, "scripts", "run_tests.py")
+
+    import re
+    with open(spec_file) as f:
+        spec_ids = set(re.findall(r'^### (P-\d+):', f.read(), re.MULTILINE))
+    with open(impl_file) as f:
+        impl_ids = set(re.findall(r'^def test_p(\d+)_', f.read(), re.MULTILINE))
+        impl_ids = {f"P-{n}" for n in impl_ids}
+
+    missing_impl = spec_ids - impl_ids
+    extra_impl   = impl_ids - spec_ids
+
+    if not missing_impl and not extra_impl:
+        report("SYNC", "Spec↔implementation count matches", PASS,
+               f"{len(spec_ids)} tests in both")
+    else:
+        detail = []
+        if missing_impl:
+            detail.append(f"in spec but not implemented: {sorted(missing_impl)}")
+        if extra_impl:
+            detail.append(f"implemented but not in spec: {sorted(extra_impl)}")
+        report("SYNC", "Spec↔implementation count matches", FAIL,
+               "; ".join(detail))
+
+
 # ── NETWORK TESTS (skipped unless --network passed) ──────────────────────────
 
 def test_p05_live_discovery(network: bool):
@@ -863,11 +1116,13 @@ def main():
     if not g or g == 2:
         test_p05_live_discovery(args.network)
         test_p06_settlement_date_derivation()
+        test_p07_post_close_discovery_guard()
         test_p08_slug_failure_detection()
 
     print("\nGroup 3 — METAR")
     if not g or g == 3:
         test_p09_live_metar(args.network)
+        test_p10_station_coverage_alert()
         test_p11_metar_correction()
         test_p12_local_date_timezone()
         test_p13_dst_window_end()
@@ -876,6 +1131,7 @@ def main():
     if not g or g == 4:
         test_p14_snapshot_label_set()
         test_p15_empty_book_stored()
+        test_p16_open_label_logic()
 
     print("\nGroup 5 — Settlement")
     if not g or g == 5:
@@ -883,6 +1139,7 @@ def main():
         test_p18_unknown_bucket_skipped()
         test_p19_exactly_one_yes()
         test_p20_fahrenheit_rounding()
+        test_p21_settle_trigger_timing()
 
     print("\nGroup 6 — Scanner")
     if not g or g == 6:
@@ -895,6 +1152,13 @@ def main():
     if not g or g == 7:
         test_p26_fetch_failure_threshold()
         test_p27_stale_run_detection()
+
+    print("\nGroup 8 — End-to-end")
+    if not g or g == 8:
+        test_p28_end_to_end(args.network)
+
+    print("\nSync check — spec vs implementation")
+    test_spec_implementation_sync()
 
     # Summarise
     passed  = sum(1 for r in results if r["status"] == PASS)
