@@ -344,17 +344,17 @@ on top of ECMWF's natural ~4–5h post-run time, yielding 6–8h total. Direct g
 then compute daily max across 3-hourly steps within each airport's local calendar day.
 **Timestamps stored**: `model_run_utc`, `fetched_utc`
 
-**Step selection — must use `game_start_time_utc`, not UTC date**: GRIB2 indexes data by
+**Step selection — must use `temp_window_start_utc`, not UTC date**: GRIB2 indexes data by
 forecast step (integer hours from model run time), not by local calendar date. "Daily max
 within the airport's local calendar day" requires extracting exactly the steps whose valid
-UTC timestamps fall within `[game_start_time_utc, game_start_time_utc + 24h)`. A naive
+UTC timestamps fall within `[temp_window_start_utc, temp_window_start_utc + 24h)`. A naive
 approach that extracts "step +24h" as the daily high gives a single mid-morning point for
 Tokyo (00z +24h = 00:00 UTC = 09:00 JST), missing the afternoon peak entirely.
 
 Correct extraction per station:
 ```python
-# window = [game_start_time_utc, game_start_time_utc + 24h)
-window_start = datetime.fromisoformat(game_start_time_utc)
+# window = [temp_window_start_utc, temp_window_start_utc + 24h)
+window_start = datetime.fromisoformat(temp_window_start_utc)
 window_end = window_start + timedelta(hours=24)
 valid_steps = [s for s in grib_steps if window_start <= run_time + timedelta(hours=s) < window_end]
 daily_high_c = max(grib_2t[step][lat_idx, lon_idx] for step in valid_steps)
@@ -631,7 +631,8 @@ CREATE TABLE model_forecasts (
 -- Polymarket weather markets (refreshed daily by rules-first discovery)
 --
 -- KEY CLOB FIELDS (confirmed from live API):
---   game_start_time      = local midnight UTC — start of temperature measurement window
+--   game_start_time      = local midnight UTC — mapped to temp_window_start_utc (CLOB field name
+--                          uses sports-infrastructure naming; renamed here for clarity)
 --   end_date_iso         = T00:00:00Z placeholder — just a date, NOT trading close time
 --   accepting_orders     = False when trading closed
 --   accepting_order_timestamp = market creation time (when orders first accepted)
@@ -640,7 +641,7 @@ CREATE TABLE model_forecasts (
 --   neg_risk_request_id  = UMA neg-risk request identifier
 --
 -- TRADING CLOSE (confirmed): 12:00 UTC on settlement_date — from Gamma/HTML endDate field
--- TEMP WINDOW: game_start_time (local midnight) → next local midnight (full calendar day)
+-- TEMP WINDOW: temp_window_start_utc (local midnight) → next local midnight (full calendar day)
 -- RESOLUTION:  after WU/HKO/NOAA finalizes (~2h after local midnight) + Polymarket UMA
 --
 CREATE TABLE weather_markets (
@@ -664,7 +665,8 @@ CREATE TABLE weather_markets (
                                              -- noaa_wrh_timeseries | unknown
     resolution_source_url   TEXT,            -- exact URL named in rules
     raw_market_json         TEXT,            -- raw CLOB market payload for audit/replay
-    game_start_time_utc     TEXT,            -- CLOB field: local midnight UTC = temp window start
+    temp_window_start_utc   TEXT,            -- local midnight UTC = temperature measurement window start
+                                             -- (maps to CLOB 'game_start_time'; renamed for clarity)
     close_time_utc          TEXT,            -- T12:00:00Z on settlement_date = trading close
     accepting_order_ts_utc  TEXT,            -- CLOB accepting_order_timestamp = market creation
     neg_risk_market_id      TEXT,            -- CLOB neg_risk_market_id — groups all city/date buckets
@@ -943,20 +945,21 @@ UTC midnight and local midnight don't coincide, which is all non-UTC stations.
 **Rule**: `settlement_date` = the local calendar day being measured (midnight to midnight local).
 `close_time_utc` = confirmed universal `T12:00:00Z` on the named UTC date for all weather markets.
 
-Canonical derivation — use `game_start_time_utc`, not `close_time_utc` (store as a comment in `discover_markets.py`):
+Canonical derivation — use `temp_window_start_utc`, not `close_time_utc` (store as a comment in `discover_markets.py`):
 ```python
-# PRIMARY: derive settlement_date from game_start_time_utc (local midnight = start of day)
-# game_start_time is always stored as the UTC moment of local midnight for the measured day.
+# PRIMARY: derive settlement_date from temp_window_start_utc (local midnight = start of day)
+# temp_window_start_utc maps to the CLOB's game_start_time field (renamed for clarity).
+# It is always the UTC moment of local midnight for the day being measured.
 # Converting it to local time and extracting the date is unambiguous for all cities and DST states.
 from zoneinfo import ZoneInfo
-game_local = datetime.fromisoformat(game_start_time_utc).astimezone(ZoneInfo(station_tz))
-settlement_date = game_local.date().isoformat()  # always the local date being measured
+window_local = datetime.fromisoformat(temp_window_start_utc).astimezone(ZoneInfo(station_tz))
+settlement_date = window_local.date().isoformat()  # always the local date being measured
 ```
 
 Do NOT derive `settlement_date` from `close_time_utc`. The midnight-check workaround
 (`if close_local.time() == midnight: subtract 1 day`) fails during Wellington's daylight
 saving (NZDT, UTC+13): `12:00 UTC → 01:00 NZDT`, which is not midnight, so no subtraction
-occurs and the stored date is one day too late. `game_start_time_utc` is the correct and
+occurs and the stored date is one day too late. `temp_window_start_utc` is the correct and
 DST-safe primary source for settlement_date derivation — it is always the UTC instant of
 local midnight for the day being measured, regardless of timezone offset or DST state.
 
@@ -973,11 +976,11 @@ Do NOT add `AND observed_utc <= close_time_utc`. Trading closure at 12:00 UTC do
 not end the temperature measurement window. Polymarket resolves after local midnight
 using the finalized full-day reading from the market's named source.
 
-The `local_date` to query — derive from `game_start_time_utc` (same as `settlement_date`):
+The `local_date` to query — derive from `temp_window_start_utc` (same as `settlement_date`):
 ```python
 from zoneinfo import ZoneInfo
-game_local = datetime.fromisoformat(game_start_time_utc).astimezone(ZoneInfo(station_tz))
-settlement_day = game_local.date().isoformat()  # DST-safe; correct for Wellington NZDT
+window_local = datetime.fromisoformat(temp_window_start_utc).astimezone(ZoneInfo(station_tz))
+settlement_day = window_local.date().isoformat()  # DST-safe; correct for Wellington NZDT
 ```
 
 **The rounding problem**: Settlement sources can report fractional degrees (e.g. WU 21.7°C,
@@ -1089,10 +1092,10 @@ WHERE station = ? AND DATE(ts_utc) = ?        -- will be wrong for non-UTC stati
 -- ✗ Wrong: derive local date at query time
 WHERE DATE(ts_utc) = DATE('now')               -- server UTC, not station local
 
--- ✓ Correct: derive settlement local date (DST-safe — use game_start_time_utc, not close_time_utc)
+-- ✓ Correct: derive settlement local date (DST-safe — use temp_window_start_utc, not close_time_utc)
 -- In Python before querying:
--- game_local = datetime.fromisoformat(game_start_time_utc).astimezone(ZoneInfo(tz))
--- local_date = game_local.date().isoformat()
+-- window_local = datetime.fromisoformat(temp_window_start_utc).astimezone(ZoneInfo(tz))
+-- local_date = window_local.date().isoformat()
 
 -- ✓ Correct: Q2 settlement query — exclude unconfirmed rounding
 -- Always gate on resolution_status before drawing strategy conclusions:
@@ -1209,7 +1212,7 @@ Actual rules text scraped from live NYC market:
 
 | Field | Value | Meaning |
 |-------|-------|---------|
-| `game_start_time` | local midnight UTC (e.g. `2026-05-30T04:00:00Z` for NYC EDT) | Temperature window opens — start of local calendar day |
+| `game_start_time` (CLOB) → `temp_window_start_utc` (DB) | local midnight UTC (e.g. `2026-05-30T04:00:00Z` for NYC EDT) | Temperature window opens — start of local calendar day. Renamed on ingestion to remove sports-infrastructure naming. |
 | `end_date_iso` | `T00:00:00Z` date placeholder | Date only — NOT a meaningful time; ignore for timing |
 | `accepting_order_timestamp` | ~2 days before settlement | Market creation time — when orders first accepted |
 
@@ -1224,7 +1227,7 @@ Actual rules text scraped from live NYC market:
 | Event | UTC time | Notes |
 |-------|----------|-------|
 | Market created | `accepting_order_timestamp` (~T-48h) | Buckets appear in CLOB |
-| Temperature window opens | `game_start_time` = local midnight | WU/HKO/NOAA begins tracking for this local date |
+| Temperature window opens | `temp_window_start_utc` = local midnight | WU/HKO/NOAA begins tracking for this local date |
 | **Trading closes** | **12:00 UTC on settlement_date** | Positions locked; `accepting_orders=False` |
 | Temperature window closes | Next local midnight | Full 24h local calendar day complete |
 | Source finalizes | ~2h after local midnight | WU/HKO/NOAA publishes confirmed daily high |
@@ -1299,7 +1302,7 @@ This will fail silently when fetches happen near UTC midnight for UTC+ stations.
       so `forecast_date` is in station's local calendar, not UTC
 - [x] Create `scripts/init_db.py` as single schema owner; apply new schema
 - [x] `discover_markets.py` refined: populate `weather_markets` table including
-      confirmed CLOB fields: `game_start_time_utc`, `neg_risk_market_id`,
+      confirmed CLOB fields: `temp_window_start_utc`, `neg_risk_market_id`,
       `neg_risk_request_id`, `accepting_order_ts_utc`; set `close_time_utc` from
       Gamma `endDate` (T12:00:00Z); store `rules_source`, `resolution_source_url`,
       `settlement_rounding_rule`, units, bucket ranges, and raw market JSON
@@ -1314,11 +1317,11 @@ This will fail silently when fetches happen near UTC midnight for UTC+ stations.
       Ankara, Wellington, Shenzhen, Guangzhou, NYC, Miami) use WU as settlement source.
       Until this adapter exists, `settlement_value_proxy` is NULL and `proxy_outcome` is
       never populated for these cities. HKO and NOAA adapters are built; WU is the gap.
-- [ ] **Fix `settlement_date` derivation in `discover_markets.py`**: use `game_start_time_utc`
+- [ ] **Fix `settlement_date` derivation in `discover_markets.py`**: use `temp_window_start_utc`
       converted to station local timezone — NOT `day.isoformat()` (UTC loop date) and NOT
       the `close_time_utc` midnight-check workaround (fails for Wellington NZDT, UTC+13,
       where 12:00 UTC = 01:00 local, not midnight). See "Analysis Query Correctness" for
-      the canonical `game_start_time_utc` derivation.
+      the canonical `temp_window_start_utc` derivation.
 - [ ] **Fix `settlement_rounding_rule` conflation**: `_rounding_rule()` currently returns
       `'one_decimal'` (source precision) but the schema expects the resolution rounding
       operation (`'round'` / `'floor'` / `'ceiling'`). Fix `_rounding_rule()` to return
@@ -1378,7 +1381,7 @@ This will fail silently when fetches happen near UTC midnight for UTC+ stations.
       books, rather than returning None. Preserves the "we polled at T and books were
       empty" record needed for post-close convergence analysis.
 - [ ] **Add ECMWF step-window derivation**: implement step selection using
-      `game_start_time_utc` as window start rather than UTC calendar date. Store first
+      `temp_window_start_utc` as window start rather than UTC calendar date. Store first
       and last step used in `raw_payload_json`.
 - [ ] **Add GFS stale-run detection**: after each open-meteo fetch, compare
       `fetched_utc - configured_offset` against nominal run time. If delta > 2h, log

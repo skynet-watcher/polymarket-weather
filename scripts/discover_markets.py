@@ -182,7 +182,7 @@ def _upsert_market(
             bucket_type, lower_temp, upper_temp, bucket_unit, settlement_unit,
             yes_token_id, no_token_id, question, rules_text, rules_source,
             resolution_source_type, resolution_source_url, raw_market_json,
-            game_start_time_utc, close_time_utc, accepting_order_ts_utc,
+            temp_window_start_utc, close_time_utc, accepting_order_ts_utc,
             neg_risk_market_id, neg_risk_request_id, first_seen_utc,
             settlement_rounding_rule, active
         )
@@ -206,7 +206,7 @@ def _upsert_market(
             resolution_source_type=excluded.resolution_source_type,
             resolution_source_url=excluded.resolution_source_url,
             raw_market_json=excluded.raw_market_json,
-            game_start_time_utc=excluded.game_start_time_utc,
+            temp_window_start_utc=excluded.temp_window_start_utc,
             close_time_utc=excluded.close_time_utc,
             accepting_order_ts_utc=excluded.accepting_order_ts_utc,
             neg_risk_market_id=excluded.neg_risk_market_id,
