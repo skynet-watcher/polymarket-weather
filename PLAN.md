@@ -149,6 +149,29 @@ calendar day, written after local midnight) from final settlement (Polymarket/UM
 outcome), storing both. `settlement_value_proxy` comes from the named source adapter
 (WU/HKO/NOAA), not raw METAR — METAR is only the fast intraday signal.
 
+### All weather staircase markets are neg-risk markets
+
+Confirmed from CLOB API: `neg_risk: true` for every weather bucket market.
+`neg_risk_market_id` groups all buckets for the same city + settlement date.
+
+This has two direct implications:
+
+**1. Neg-risk arbitrage applies**
+The same "above X°C YES ≈ sum of constituent bucket YES prices" constraint that
+applies to BTC staircase markets applies here. The neg-risk scanner for weather
+should use `neg_risk_market_id` to identify the group, then check the consistency
+constraint across all buckets in the group.
+
+**2. Capital efficiency for multi-leg trades**
+Polymarket's neg-risk collateral netting applies. Buying NO on multiple buckets
+in the same neg-risk group does not require posting full face value for each leg.
+Maximum loss = 1 × stake (you can only be in the wrong bucket once).
+
+Store `neg_risk_market_id` and `neg_risk_request_id` in `weather_markets` for
+group lookups in the scanner.
+
+---
+
 ### Source adapters required
 
 The system must support at least these settlement-source adapters:
@@ -445,6 +468,20 @@ CREATE TABLE model_forecasts (
 );
 
 -- Polymarket weather markets (refreshed daily by rules-first discovery)
+--
+-- KEY CLOB FIELDS (confirmed from live API):
+--   game_start_time      = local midnight UTC — start of temperature measurement window
+--   end_date_iso         = T00:00:00Z placeholder — just a date, NOT trading close time
+--   accepting_orders     = False when trading closed
+--   accepting_order_timestamp = market creation time (when orders first accepted)
+--   neg_risk             = True for ALL weather staircase markets
+--   neg_risk_market_id   = groups all buckets for same city+date (use for neg-risk scanner)
+--   neg_risk_request_id  = UMA neg-risk request identifier
+--
+-- TRADING CLOSE (confirmed): 12:00 UTC on settlement_date — from Gamma/HTML endDate field
+-- TEMP WINDOW: game_start_time (local midnight) → next local midnight (full calendar day)
+-- RESOLUTION:  after WU/HKO/NOAA finalizes (~2h after local midnight) + Polymarket UMA
+--
 CREATE TABLE weather_markets (
     condition_id            TEXT PRIMARY KEY,
     event_slug              TEXT,
@@ -465,19 +502,18 @@ CREATE TABLE weather_markets (
     resolution_source_type  TEXT,            -- wunderground_daily | hong_kong_observatory_daily |
                                              -- noaa_wrh_timeseries | unknown
     resolution_source_url   TEXT,            -- exact URL named in rules
-    raw_market_json         TEXT,            -- raw Gamma market payload for audit/replay
+    raw_market_json         TEXT,            -- raw CLOB market payload for audit/replay
+    game_start_time_utc     TEXT,            -- CLOB field: local midnight UTC = temp window start
+    close_time_utc          TEXT,            -- T12:00:00Z on settlement_date = trading close
+    accepting_order_ts_utc  TEXT,            -- CLOB accepting_order_timestamp = market creation
+    neg_risk_market_id      TEXT,            -- CLOB neg_risk_market_id — groups all city/date buckets
+    neg_risk_request_id     TEXT,            -- CLOB neg_risk_request_id — UMA identifier
     first_seen_utc          TEXT,            -- when discover_markets.py first found this market
-    close_time_utc          TEXT,            -- settlement UTC time from Polymarket end_date
     settlement_value_proxy  REAL,            -- Q2: normalized proxy source value in settlement_unit
     settlement_value_final  REAL,            -- Q2: final Polymarket/UMA resolved value/outcome
     settlement_source       TEXT,            -- which source was used for proxy settlement
-    settlement_rounding_rule TEXT,           -- Q2: how Polymarket rounds fractional temps
-                                             --     'round' | 'floor' | 'ceiling' | unknown
-                                             --     source reports 21.7C; bucket is integer 22C
-                                             --     must apply same rule or proxy match fails
-    -- settlement_window_hours REMOVED — was based on wrong model.
-    -- Trading close (12:00 UTC) ≠ temperature measurement end.
-    -- Resolution = full source-specific local calendar day per market rules.
+    settlement_rounding_rule TEXT,           -- 'round' | 'floor' | 'ceiling' | unknown
+                                             -- source reports 21.7C; bucket is integer 22C
     resolution_status       TEXT,            -- 'proxy_only' | 'confirmed' | 'disputed'
     settled_at_utc          TEXT,            -- when settle_markets.py ran for this market
     active                  INTEGER DEFAULT 1,
@@ -858,12 +894,30 @@ Actual rules text scraped from live NYC market:
 > for all times on this day** for the LaGuardia Airport Station... data not finalized for
 > this market's timeframe will not be considered."*
 
-**Two clocks are running independently:**
+**Three timestamps from the CLOB API (confirmed from live markets):**
 
-| Clock | What it controls | Value |
-|-------|-----------------|-------|
-| **Trading clock** | When positions lock | 12:00 UTC on named date |
-| **Temperature clock** | What temperature is used | Full local calendar day from the market's named source |
+| Field | Value | Meaning |
+|-------|-------|---------|
+| `game_start_time` | local midnight UTC (e.g. `2026-05-30T04:00:00Z` for NYC EDT) | Temperature window opens — start of local calendar day |
+| `end_date_iso` | `T00:00:00Z` date placeholder | Date only — NOT a meaningful time; ignore for timing |
+| `accepting_order_timestamp` | ~2 days before settlement | Market creation time — when orders first accepted |
+
+**One timestamp from Gamma/HTML metadata (confirmed):**
+
+| Source | Value | Meaning |
+|--------|-------|---------|
+| HTML `endDate` / Gamma metadata | `T12:00:00Z` on settlement date | **Trading close** — when positions lock |
+
+**Full confirmed timeline:**
+
+| Event | UTC time | Notes |
+|-------|----------|-------|
+| Market created | `accepting_order_timestamp` (~T-48h) | Buckets appear in CLOB |
+| Temperature window opens | `game_start_time` = local midnight | WU/HKO/NOAA begins tracking for this local date |
+| **Trading closes** | **12:00 UTC on settlement_date** | Positions locked; `accepting_orders=False` |
+| Temperature window closes | Next local midnight | Full 24h local calendar day complete |
+| Source finalizes | ~2h after local midnight | WU/HKO/NOAA publishes confirmed daily high |
+| Polymarket resolves | After source finalization | UMA resolver checks source; `closed=True`, prices snap to 0/1 |
 
 NYC trading closes at 08:00 EDT — 7 hours before the typical afternoon peak. But the
 resolution temperature is the full local calendar day. Polymarket's UMA resolver checks
@@ -929,8 +983,10 @@ This will fail silently when fetches happen near UTC midnight for UTC+ stations.
 - [ ] **Run ICON, MF, GEM**: only GFS collected so far
 - [ ] Create `scripts/init_db.py` as single schema owner; apply new schema
 - [ ] ECMWF direct via `ecmwf-opendata` (3h faster than open-meteo mirror)
-- [ ] `discover_markets.py` refined: populate `weather_markets` table with
-      `first_seen_utc`, `close_time_utc`, `rules_source`, `resolution_source_url`,
+- [ ] `discover_markets.py` refined: populate `weather_markets` table including
+      confirmed CLOB fields: `game_start_time_utc`, `neg_risk_market_id`,
+      `neg_risk_request_id`, `accepting_order_ts_utc`; set `close_time_utc` from
+      Gamma `endDate` (T12:00:00Z); store `rules_source`, `resolution_source_url`,
       `settlement_rounding_rule`, units, bucket ranges, and raw market JSON
 - [ ] `log_orderbooks.py`: compute `hours_to_close`, assign nullable `snapshot_label`,
       store sizes/depth/spread/raw book JSON
