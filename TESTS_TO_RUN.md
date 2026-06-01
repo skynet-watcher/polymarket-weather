@@ -660,3 +660,209 @@ Run these in order:
 11. Negative-risk gaps
 
 The first five priority tests make the whole research plan more robust. They answer whether signals settle correctly, whether they are executable, whether they were already priced in, how much latency matters, and whether forecast changes move the market. After that, the strategy tests can be trusted more.
+
+---
+
+## Audit — Plan Alignment Review (2026-06-01)
+
+This section records findings from cross-checking TESTS_TO_RUN.md against the current
+PLAN.md. Each item notes what the test assumes vs what the plan now specifies.
+
+---
+
+### Test 1 — Stale Observation Strategy
+
+**Issue 1.1 — Type C cities excluded after close, not noted here**
+The test describes "buy NO on impossible bucket" generically. The plan specifies that
+obs_mismatch alerts must NOT fire for Type C cities (NYC, Miami, Wellington) after
+12:00 UTC — trading is already closed and no action is possible on afternoon METAR.
+Test 1 must explicitly exclude Type C post-close signals from its signal count and PnL.
+
+**Issue 1.2 — Unit conversion not specified**
+Examples use Celsius ("Station-local high is already 28C") but NYC and Miami markets
+use Fahrenheit buckets. Before comparing `daily_high_c` against a bucket threshold,
+apply `round(daily_high_c * 9/5 + 32)` for F-unit markets. Failing to round may flag
+the wrong bucket (e.g. 35.28°C = 95.5°F rounds to 96°F, not 95°F). Add this as an
+explicit step in the signal logic.
+
+**Issue 1.3 — `daily_high_c` is a query-time aggregate, not a stored field**
+The data needed section lists "station-local daily high" as a data field. Per the plan,
+`daily_high_c` must be computed at query time as `MAX(temp_c) WHERE station=? AND local_date=?`
+— it is not reliably stored as a column (METAR corrections would corrupt it). Queries
+for this test must compute the running max fresh, not read a pre-stored value.
+
+**Issue 1.4 — Proxy vs settlement-source mismatch risk for HKO**
+The VHHH (Hong Kong) proxy has an unquantified systematic offset vs HKO. Until ≥14
+days of VHHH vs HKO settlement comparisons are measured and the offset characterised,
+all Hong Kong stale-observation signals must be flagged as "uncalibrated proxy" and
+excluded from PnL totals. Add this as an explicit Hong Kong caveat in the test results.
+
+---
+
+### Test 2 — Market-Open Forecast Accuracy
+
+**Issue 2.1 — TAF is not a T-48h source**
+Test 2 lists TAF as one of the forecasts to compare at market open. TAF's 30h horizon
+means it cannot cover the settlement date for markets discovered ≥30h before close.
+For a T-48h market open, TAF contributes zero data. Revise: "TAF is only available
+for Q1 when `(close_time_utc - first_seen_utc) <= 30h`. For market-open comparisons,
+TAF is absent and only 5 NWP models are available."
+
+**Issue 2.2 — `first_seen_utc` batch bias**
+The test uses `first_seen_utc` as market open. Per the plan, this timestamp was
+previously set once per batch run (all markets in one discovery run got the same
+timestamp), systematically biasing Q1 for markets processed late in the loop. After
+the per-market stamping fix is applied, verify that `first_seen_utc` values within
+a single run differ by at least a few seconds. Flag results from pre-fix data as
+potentially biased.
+
+**Issue 2.3 — ECMWF direct still not built**
+"ECMWF direct, once implemented" — remains unbuilt. Do not include ECMWF in model
+comparisons until it is collecting and at least 14 days of data exist. The open-meteo
+ECMWF mirror adds 1–3h delay and should be labelled `ecmwf_via_openmeteo` not
+`ecmwf_direct` to avoid confusion in results.
+
+**Issue 2.4 — Markets discovered after close must be excluded**
+Q1 queries must include `AND wm.first_seen_utc < wm.close_time_utc`. Markets
+discovered after trading closed will return post-close forecasts as "available at open."
+Apply this filter before computing any accuracy metric.
+
+---
+
+### Test 3 — Forecast Consensus vs Market Distribution
+
+**Issue 3.1 — Blocked: only GFS currently collecting**
+Test 3 requires GFS, ICON, GEM, ARPEGE, and ECMWF. Only GFS is currently running.
+This test cannot produce meaningful consensus results until ≥3 models are collecting.
+Mark as **blocked** until ICON and MF/GEM are running and have at least 14 days of data.
+
+**Issue 3.2 — Consensus spread threshold not defined for F-unit markets**
+"Flag cases where model spread <= 1.5C" — for NYC/Miami Fahrenheit markets, apply the
+equivalent threshold: 1.5°C ≈ 2.7°F. Define the threshold in native bucket units per
+city rather than universally in Celsius.
+
+---
+
+### Test 4 — Best Forecast Timing By Station
+
+**Issue 4.1 — model_run_utc is estimated for open-meteo, not actual**
+"Group forecasts into timing buckets" using `model_run_utc` — but for GFS/ICON/MF/GEM
+via open-meteo, `model_run_utc` is estimated from the known schedule plus fetch offset.
+It can be wrong when a model run is delayed. Filter to `model_run_is_estimated=0` for
+clean timing analysis, or treat open-meteo model times as ±2h approximations and use
+`fetched_utc` as the primary timing signal.
+
+**Issue 4.2 — Hong Kong timing note incomplete**
+"Treat HKO/Hong Kong separately from ZBAA" — correct, but the test should also note
+that VHHH-HKO proxy offset is unquantified. Treat Hong Kong timing results as provisional
+until the proxy offset is characterised from settlement data.
+
+---
+
+### Test 5 — Market-Open Entry With Dynamic Rebalancing
+
+**Issue 5.1 — "Fair value" is undefined**
+The test says "recalculate fair value" at every new data point but never defines it.
+Specify the computation: fair value for a bucket = model-ensemble probability that the
+settlement temperature falls in that bucket's range, converted to a probability using
+the model high's distribution (e.g. assume ±1.5°C Gaussian error, compute bucket
+probability). Without a definition, "fair value" is not reproducible.
+
+**Issue 5.2 — Polymarket taker fees not included**
+The metrics list "PnL by dynamic strategy" but do not include Polymarket taker fees
+(typically 0.2–0.5% of notional per fill, deducted from winnings). Every simulated
+PnL must subtract fees per trade. Over-trading policies will appear profitable before
+fees but lose money after. Add "Net PnL after fees" alongside gross PnL in metrics.
+
+---
+
+### Test 6 — Negative-Risk Temperature Gaps
+
+**Issue 6.1 — Gap threshold changed to 2¢ on executable prices**
+The test uses "1.5c" as the gap flag threshold. The plan now specifies 2¢ on executable
+prices (bid for the sell leg, ask for the buy leg), not midpoints. Update the threshold
+and note that midpoint gaps must be ≥ ~4¢ to produce a 2¢ executable gap after spread.
+
+**Issue 6.2 — Both gap directions required**
+The test only describes the forward direction (above_eq underpriced vs bucket sum).
+The plan now requires checking the reverse direction too (bucket sum overpriced vs
+above_eq). Add reverse gap analysis and use separate metric rows for each direction.
+
+**Issue 6.3 — Multi-group neg_risk_market_id not handled**
+"For each `neg_risk_market_id` snapshot" — the scanner must first group by
+`(city, settlement_date)` and check for multiple `neg_risk_market_id` values. If
+two groups exist for the same city+date, run the consistency check across all buckets
+combined and flag cross-group gaps separately. The test does not address this case.
+
+**Issue 6.4 — NULL `neg_risk_market_id` must be excluded**
+Markets with NULL `neg_risk_market_id` must not participate in the scan. The test
+does not mention this filter. Add `WHERE neg_risk_market_id IS NOT NULL` to all
+scanner queries.
+
+---
+
+### Test 7 — Resolution Source Mismatch Audit
+
+**Issue 7.1 — Currently blocked: WU adapter not built**
+This test requires `settlement_observations` rows for WU markets (~82% of all markets).
+Until `wunderground_daily` adapter is built and `WU_API_KEY` is configured, this test
+can only run for Hong Kong (HKO) and Moscow (NOAA). Mark as **partially blocked**.
+
+---
+
+### Test 8 — Liquidity / Executability Filter
+
+**Issue 8.1 — Spread threshold not reconciled with gap threshold**
+The test suggests "maximum spread <= 5c or <= 10c" as a liquidity filter, but the
+neg-risk gap threshold is 2¢ on executable prices. A market with a 5¢ spread produces
+a 2.5¢ cost per leg, which eliminates any gap below 5¢. The liquidity filter threshold
+and the gap threshold must be chosen consistently. Recommend: use spread ≤ 4¢ as the
+executability filter so that a 2¢ gap survives after spread on both legs.
+
+---
+
+### Test 9 — Forecast Revision Momentum
+
+**Issue 9.1 — model_run_utc estimated; revision detection unreliable**
+"Track when model forecasts move materially" requires comparing successive model runs.
+For open-meteo models, `model_run_utc` is estimated (±2h). Two rows with different
+`model_run_utc` estimates may actually be from the same run. Filter to
+`model_run_is_estimated=0` (ECMWF direct only, once built) for reliable revision
+detection, or accept that open-meteo revision analysis has ~2h ambiguity in run timing.
+
+---
+
+### Test 10 — Local-Time Weather Path
+
+**Issue 10.1 — Peak heating window hours are city-type dependent**
+The timing buckets (sunrise, morning ramp, peak heating, post-peak) must use station
+local time, not UTC. The plan's Type A/B/C typology defines when the peak window
+occurs per city. Use `local_hour` from `wx_observations` for this bucketing, and
+align bucket edges with the Type A/B/C peak windows in PLAN.md.
+
+---
+
+### Priority Order — Revised
+
+The original priority order below is updated to reflect current blocked status:
+
+| Priority | Test | Status | Blocker |
+|---|---|---|---|
+| 1 | Liquidity / Executability Filter (Test 8) | ✅ Ready | — |
+| 2 | Already Priced In (Test 12) | ✅ Ready | — |
+| 3 | Data Delay / Source Latency (Test 14) | ✅ Ready | — |
+| 4 | Local-Time Weather Path (Test 10) | ✅ Ready | — |
+| 5 | Stale Observation Strategy (Test 1) | ⚠️ Partial | HKO/NOAA only until WU built; Type C caveat required |
+| 6 | Negative-Risk Gaps (Test 6) | ✅ Ready | — |
+| 7 | Resolution Source Mismatch (Test 7) | ⛔ Partial | WU adapter missing |
+| 8 | Market-Open Forecast Accuracy (Test 2) | ⚠️ Partial | Only GFS; TAF T-48h limitation |
+| 9 | Forecast Revision Momentum (Test 9) | ⚠️ Partial | model_run_utc estimated for open-meteo |
+| 10 | Forecast Consensus vs Market (Test 3) | ⛔ Blocked | Requires ≥3 models |
+| 11 | Best Forecast Timing (Test 4) | ⛔ Blocked | Requires ≥3 models + 14 days |
+| 12 | Dynamic Rebalancing (Test 5) | ⛔ Blocked | Requires settlement + multiple models |
+| 13 | Station Microclimate Reliability (Test 11) | ⛔ Blocked | Requires 2+ weeks + settlement |
+| 14 | Bucket Adjacency / Hedge Quality (Test 13) | ⛔ Blocked | Requires settlement data |
+
+Run tests in priority order. Do not advance to blocked tests before their prerequisites
+are met. See PREPRODUCTION_TESTS.md for system validation tests that must pass before
+any analytical tests can be trusted.
