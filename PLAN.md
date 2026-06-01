@@ -329,10 +329,9 @@ CREATE TABLE weather_markets (
                                              --     'round' | 'floor' | 'ceiling' | unknown
                                              --     METAR reports 21.7C; bucket is integer 22C
                                              --     must apply same rule or proxy match fails
-    settlement_window_hours  REAL,           -- hours from local midnight to settlement
-                                             --     NYC/Miami ≈ 8h (morning only)
-                                             --     Seoul/Tokyo ≈ 21h (full day)
-                                             --     determines what "daily high" means here
+    -- settlement_window_hours REMOVED — was based on wrong model.
+    -- Trading close (12:00 UTC) ≠ temperature measurement end.
+    -- Resolution = WU full local calendar day per market rules.
     resolution_status       TEXT,            -- 'proxy_only' | 'confirmed' | 'disputed'
     settled_at_utc          TEXT,            -- when settle_markets.py ran for this market
     active                  INTEGER DEFAULT 1,
@@ -525,20 +524,27 @@ guarantees you get the measured day's date, not the settlement day's date.
 
 ### Q2: actual temperature resolution
 
-**The settlement lookup**: `MAX(temp_c) WHERE station=? AND local_date=? AND observed_utc <= close_time_utc`
+**The settlement lookup**: `MAX(temp_c) WHERE station=? AND local_date=?`
 
-`settle_markets.py` runs 30 minutes after `close_time_utc`. The daily high must be
-computed only over observations from local midnight up to `close_time_utc` — not from
-midnight to midnight — because several cities (NYC, Miami, London, Madrid) settle before
-their afternoon peak. Including post-settlement readings would give a higher value than
-WU reports at settlement time.
+`settle_markets.py` runs ~2h after local midnight (when the local calendar day is
+complete and WU has had time to finalize). The daily high covers the full local calendar
+day — midnight to midnight local — matching the rules language: "highest temperature
+recorded for all times on this day."
 
-The `local_date` to query must be the settlement day's local calendar date, derived
-by backing off 12 hours from `close_time_utc` before converting to local time:
+Do NOT add `AND observed_utc <= close_time_utc`. Trading closure at 12:00 UTC does
+not end the temperature measurement window. Polymarket resolves after local midnight
+using the finalized full-day WU reading.
+
+The `local_date` to query:
 ```python
-settlement_day = (datetime.fromisoformat(close_time_utc) - timedelta(hours=12)).astimezone(tz).date()
+close_local = datetime.fromisoformat(close_time_utc).astimezone(ZoneInfo(tz))
+# Handle Wellington edge case: if close_time is exactly local midnight,
+# the measured day is the previous local date
+if close_local.time() == datetime.time(0, 0):
+    settlement_day = (close_local - timedelta(days=1)).date()
+else:
+    settlement_day = close_local.date()
 ```
-This correctly handles Wellington (where 12:00 UTC = midnight NZST next day).
 
 Correct pattern:
 ```python
@@ -642,30 +648,61 @@ The plan designates it as single source of truth but it currently only has:
 Missing: `timezone, lat, lon`
 All scripts that need these fields (fetch_weather.py, settle_markets.py) hardcode them instead.
 
-**3. Settlement time confirmed: 12:00 UTC for all weather markets**
-Scraped from a known-settled Seoul May 30 market: `end_date_iso = '2026-05-30T12:00:00Z'`.
-`close_time_utc = settlement_date + 'T12:00:00Z'` for all cities. This is universal.
+**3. Settlement time and temperature window — two separate clocks**
 
-However, 12:00 UTC resolves to very different local times per city, and several cities
-settle BEFORE their typical afternoon temperature peak:
+`end_date_iso` confirmed as `2026-06-01T12:00:00Z` for all weather markets globally.
+This is the **trading close** — when positions lock. It is NOT the temperature measurement
+window end.
 
-| City group | Local settlement time | vs daily peak | Implication |
-|-----------|----------------------|---------------|-------------|
-| Seoul, Tokyo, Beijing, Singapore | ~20:00–21:00 local | ✓ after peak | Full day measured |
-| Wellington | 00:00 local next day (midnight) | ✓ full day complete | Correct |
-| London, Paris, Munich, Amsterdam | 13:00–14:00 local | ✗ 1–2h before peak | Partial day |
-| Madrid | 14:00 local | ✗ 2h before peak | Partial day |
-| NYC, Miami | 08:00 local | ✗ 7h before peak | Morning only |
+Actual rules text scraped from live NYC market:
 
-**Implication for daily_high_c**: do NOT track the running max from local midnight to
-local midnight. Track from local midnight to `close_time_utc` in local time. For NYC,
-the "daily high" this system should record is the max observed between midnight EDT and
-08:00 EDT — matching the window WU has data for when Polymarket resolves.
+> *"This market will resolve to the temperature range that contains the highest temperature
+> recorded at the LaGuardia Airport Station in degrees Fahrenheit on 1 Jun '26. The
+> resolution source will be Wunderground, specifically the **highest temperature recorded
+> for all times on this day** for the LaGuardia Airport Station... data not finalized for
+> this market's timeframe will not be considered."*
 
-For any city settling before the afternoon peak, our METAR daily high collected after
-08:00 local will be higher than the WU settlement value. This is not a bug in data
-collection — it reflects how the market is designed. Flag it in analysis as
-`settlement_window_hours` (= hours from local midnight to settlement).
+**Two clocks are running independently:**
+
+| Clock | What it controls | Value |
+|-------|-----------------|-------|
+| **Trading clock** | When positions lock | 12:00 UTC on named date |
+| **Temperature clock** | What temperature is used | WU full local calendar day (midnight to midnight local) |
+
+NYC trading closes at 08:00 EDT — 7 hours before the typical afternoon peak. But the
+resolution temperature is the full local calendar day. Polymarket's UMA resolver checks
+WU after the local day is complete and the data is finalized. Trading may be locked but
+the actual temperature keeps being measured until local midnight.
+
+**settle_markets.py must run after the LOCAL DAY ends**, not 30 minutes after trading close.
+"30 min after `close_time_utc`" was wrong — that fires during the local day for NYC/Miami/London.
+
+Correct settle_markets.py fire times per city (~2h after local midnight):
+
+| City | Local midnight (UTC) | Settle_markets runs |
+|------|---------------------|---------------------|
+| Seoul / Tokyo | 15:00 UTC same day | ~17:00 UTC same day |
+| Wellington | 12:00 UTC same day | ~14:00 UTC same day |
+| Beijing / Shenzhen / Guangzhou / Singapore | 16:00 UTC same day | ~18:00 UTC same day |
+| Helsinki (Moscow*) | 21:00 UTC same day | ~23:00 UTC same day |
+| Madrid | 22:00 UTC same day | ~00:00 UTC next day |
+| London | 23:00 UTC same day | ~01:00 UTC next day |
+| NYC / Miami | 04:00 UTC next day | ~06:00 UTC next day |
+
+**daily_high_c definition (corrected)**:
+Track `MAX(temp_c)` from local midnight to local midnight — the full local calendar day.
+Do NOT cap at `close_time_utc`. The trading window closing does not end the temperature
+measurement period.
+
+**settlement_date derivation**:
+Parse the local date from the market question or URL (most reliable).
+If deriving from `close_time_utc`: convert to station local timezone; if result is
+exactly midnight (00:00), the date being measured is the previous local date (Wellington
+edge case). Cleaner: `settlement_date = close_utc.astimezone(tz).date()` except when
+`close_utc.astimezone(tz).time() == midnight`, subtract one day.
+
+**Fields removed from schema** (were based on wrong model):
+- ~~`settlement_window_hours`~~ — removed. Not a meaningful concept given two-clock model.
 
 **4. forecast_date timezone: looks correct by coincidence today**
 At 03:03 UTC on June 1, all station UTC dates and local dates happen to match (it is
