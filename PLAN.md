@@ -2,12 +2,15 @@
 
 ## What This Is
 
-Polymarket currently tracks **17 city markets** across **16 unique settlement stations**
-(Hong Kong and Beijing both map to ZBAA).
+This repo starts as a **selected weather-market pilot**, not full Polymarket weather coverage.
+The initial pilot covers 17 configured city markets, but live Polymarket weather currently
+contains many more city/event slugs. Discovery must be rules-first so the pilot can expand
+without changing the core schema.
 
-Each day: "Will the highest temperature in [City] be exactly X°C?" markets
-settle at the day's official high temperature from a specific airport weather station
-named in each market's resolution rules.
+Each day: "Will the highest temperature in [City] be X?" markets settle at the day's
+official high temperature from the source named in each market's resolution rules.
+Markets are not all Celsius exact buckets: some are Fahrenheit, some are ranges, some
+are `or below` / `or above`, and some use non-Wunderground sources.
 
 This project collects three categories of data:
 1. **METAR observations** — live airport instrument readings used as a fast intraday proxy
@@ -18,30 +21,44 @@ Goal: Find gaps between what forecasts say, what the thermometer reads, and what
 
 ---
 
-## Settlement Stations
+## Pilot Settlement Sources
 
-| City        | Station | Airport                        | Timezone         | Notes                         |
-|-------------|---------|--------------------------------|------------------|-------------------------------|
-| Seoul       | RKSI    | Incheon International          | Asia/Seoul       |                               |
-| Hong Kong   | ZBAA    | Beijing Capital International  | Asia/Shanghai    | ⚠️ Anomaly — resolves on Beijing station |
-| London      | EGLC    | London City Airport            | Europe/London    |                               |
-| Tokyo       | RJTT    | Haneda Airport                 | Asia/Tokyo       |                               |
-| NYC         | KLGA    | LaGuardia Airport              | America/New_York |                               |
-| Paris       | LFPB    | Le Bourget Airport             | Europe/Paris     |                               |
-| Beijing     | ZBAA    | Beijing Capital International  | Asia/Shanghai    |                               |
-| Miami       | KMIA    | Miami International Airport    | America/New_York |                               |
-| Singapore   | WSSS    | Changi Airport                 | Asia/Singapore   |                               |
-| Madrid      | LEMD    | Barajas Airport                | Europe/Madrid    |                               |
-| Moscow      | EFHK    | Helsinki Vantaa Airport        | Europe/Helsinki  | ⚠️ Anomaly — resolves on Helsinki station |
-| Munich      | EDDM    | Munich Airport                 | Europe/Berlin    |                               |
-| Amsterdam   | EHAM    | Schiphol Airport               | Europe/Amsterdam |                               |
-| Ankara      | LTAC    | Ankara Esenboga Airport        | Europe/Istanbul  |                               |
-| Wellington  | NZWN    | Wellington Airport             | Pacific/Auckland |                               |
-| Shenzhen    | ZGSZ    | Shenzhen Bao'an Airport        | Asia/Shanghai    |                               |
-| Guangzhou   | ZGGG    | Guangzhou Baiyun Airport       | Asia/Shanghai    |                               |
+These are starting assumptions only. They must be refreshed from live Polymarket/Gamma
+rules during discovery. `data/city_stations.json` is a cached/enriched config, not the
+authority. The authority is the per-market rules text and resolution source.
 
-All station metadata (city, station, lat, lon, timezone, WU path, anomaly flags) lives in
-`data/city_stations.json` as the single source of truth. All scripts load from there.
+| City        | Fast Proxy Station | Expected Source / Station      | Timezone         | Notes                         |
+|-------------|--------------------|--------------------------------|------------------|-------------------------------|
+| Seoul       | RKSI               | Incheon International          | Asia/Seoul       |                               |
+| Hong Kong   | HKO/HKO            | Hong Kong Observatory          | Asia/Hong_Kong   | Rules source is HKO Daily Extract, not WU/ZBAA |
+| London      | EGLC               | London City Airport            | Europe/London    |                               |
+| Tokyo       | RJTT               | Haneda Airport                 | Asia/Tokyo       |                               |
+| NYC         | KLGA               | LaGuardia Airport              | America/New_York | Fahrenheit range buckets       |
+| Paris       | LFPB               | Le Bourget Airport             | Europe/Paris     |                               |
+| Beijing     | ZBAA               | Beijing Capital International  | Asia/Shanghai    |                               |
+| Miami       | KMIA               | Miami International Airport    | America/New_York | Fahrenheit range buckets       |
+| Singapore   | WSSS               | Changi Airport                 | Asia/Singapore   |                               |
+| Madrid      | LEMD               | Barajas Airport                | Europe/Madrid    |                               |
+| Moscow      | UUWW               | NOAA Vnukovo International     | Europe/Moscow    | Rules source is NOAA, not EFHK |
+| Munich      | EDDM               | Munich Airport                 | Europe/Berlin    |                               |
+| Amsterdam   | EHAM               | Schiphol Airport               | Europe/Amsterdam |                               |
+| Ankara      | LTAC               | Ankara Esenboga Airport        | Europe/Istanbul  |                               |
+| Wellington  | NZWN               | Wellington Airport             | Pacific/Auckland |                               |
+| Shenzhen    | ZGSZ               | Shenzhen Bao'an Airport        | Asia/Shanghai    |                               |
+| Guangzhou   | ZGGG               | Guangzhou Baiyun Airport       | Asia/Shanghai    |                               |
+
+All enriched metadata lives in `data/city_stations.json` after discovery:
+
+- city and event slug
+- fast proxy station
+- resolution source name and URL
+- source-specific station code
+- lat/lon/timezone
+- bucket unit and settlement unit
+- precision and rounding rule
+- anomaly/source notes
+
+During discovery, live Gamma/Polymarket rules overwrite stale config assumptions.
 
 ---
 
@@ -102,7 +119,7 @@ high without any ability to react to observed temperatures.
 # AND we are in or past the peak window for this city type
 
 TYPE_A_STATIONS = {'RKSI', 'RJTT', 'ZBAA', 'ZGSZ', 'ZGGG', 'WSSS'}  # peak 05-07 UTC
-TYPE_B_STATIONS = {'EGLC', 'LFPB', 'EDDM', 'EHAM', 'LEMD', 'LTAC', 'EFHK'}  # peak 12-14 UTC
+TYPE_B_STATIONS = {'EGLC', 'LFPB', 'EDDM', 'EHAM', 'LEMD', 'LTAC', 'UUWW'}  # peak 12-14 UTC
 TYPE_C_STATIONS = {'KLGA', 'KMIA', 'NZWN'}  # peak after trading closes
 
 # For Type C: obs_mismatch is irrelevant after close_time_utc
@@ -127,6 +144,32 @@ a local met service, or another station.
 
 `settle_markets.py` separates proxy settlement (METAR daily high at close time) from final
 settlement (Polymarket/UMA resolved outcome), storing both.
+
+### Source adapters required
+
+The system must support at least these settlement-source adapters:
+
+- `wunderground_daily`: Wunderground daily history table for station daily high
+- `hong_kong_observatory_daily`: HKO Daily Extract, Absolute Daily Max
+- `noaa_wrh_timeseries`: NOAA WRH time series, highest value under `Temp`
+- `polymarket_final`: final Polymarket/UMA resolved outcome
+
+Every adapter stores normalized values plus raw payloads. If a market names an unknown
+source, discovery should still store the market but mark `resolution_source_type='unknown'`
+and prevent strategy conclusions until a source adapter exists.
+
+### Rules-first discovery
+
+Market discovery is rules-first:
+
+1. Discover active weather event slugs.
+2. Fetch Gamma event payloads by slug.
+3. Store every market's `question`, `description`/rules text, `resolutionSource`,
+   `endDate`, `conditionId`, token IDs, and raw market JSON.
+4. Parse source, units, bucket type/range, precision, and rounding from the rules/question.
+5. Use `data/city_stations.json` only as enrichment/cache.
+
+No analysis should depend on manually maintained station assumptions when live rules disagree.
 
 ---
 
@@ -233,31 +276,39 @@ HAVING mf.fetched_utc = MAX(mf.fetched_utc)
 ### Q2: What was the actual temperature resolution?
 
 **What "resolution" means**: Two separate answers exist:
-- **Proxy resolution**: running METAR daily high at the station as of close time (fast, available same day)
+- **Proxy resolution**: source-adapted daily high from the market's named resolution source,
+  or fast proxy data when the final source is not yet available
 - **Final resolution**: the Polymarket/UMA outcome (authoritative, available after settlement confirms)
 
 **The query**:
 ```sql
 SELECT wm.condition_id, wm.city, wm.settlement_date,
-       wm.settlement_temp_c_proxy,   -- METAR daily high at close time
-       wm.settlement_temp_c_final,   -- Polymarket/UMA resolved outcome (if available)
+       wm.settlement_value_proxy,    -- source-adapted daily high
+       wm.settlement_value_final,    -- Polymarket/UMA resolved outcome (if available)
        wm.settlement_source,
        wm.settled_at_utc,
-       wm.bucket_type, wm.temp_c,
+       wm.bucket_type, wm.lower_temp, wm.upper_temp, wm.bucket_unit,
        CASE
-         WHEN wm.bucket_type = 'exact'    AND wm.settlement_temp_c_proxy = wm.temp_c  THEN 'YES'
-         WHEN wm.bucket_type = 'above_eq' AND wm.settlement_temp_c_proxy >= wm.temp_c THEN 'YES'
-         WHEN wm.bucket_type = 'below_eq' AND wm.settlement_temp_c_proxy <= wm.temp_c THEN 'YES'
+         WHEN wm.bucket_type = 'exact'
+              AND wm.settlement_value_proxy = wm.lower_temp THEN 'YES'
+         WHEN wm.bucket_type = 'range'
+              AND wm.settlement_value_proxy BETWEEN wm.lower_temp AND wm.upper_temp THEN 'YES'
+         WHEN wm.bucket_type = 'above_eq'
+              AND wm.settlement_value_proxy >= wm.lower_temp THEN 'YES'
+         WHEN wm.bucket_type = 'below_eq'
+              AND wm.settlement_value_proxy <= wm.upper_temp THEN 'YES'
          ELSE 'NO'
        END as resolved_proxy
 FROM weather_markets wm
 WHERE wm.settlement_date = ?
-ORDER BY wm.city, wm.temp_c
+ORDER BY wm.city, wm.lower_temp
 ```
 
 **Requires**:
-- `weather_markets.settlement_temp_c_proxy` — METAR daily high written by `settle_markets.py`
-- `weather_markets.settlement_temp_c_final` — Polymarket/UMA outcome, written when available
+- `weather_markets.settlement_value_proxy` — source-adapted daily high written by `settle_markets.py`
+- `weather_markets.settlement_value_final` — Polymarket/UMA outcome, written when available
+- `weather_markets.settlement_unit` — unit of the normalized settlement value
+- `weather_markets.bucket_unit` — unit used by bucket thresholds
 - `weather_markets.settlement_source` — which source was used
 - `weather_markets.settled_at_utc`
 
@@ -270,12 +321,12 @@ ORDER BY wm.city, wm.temp_c
 **The query**:
 ```sql
 SELECT ob.snapshot_label, ob.ts_utc, ob.hours_to_close,
-       wm.temp_c, wm.bucket_type,
-       ob.yes_bid, ob.yes_ask, ob.yes_mid
+       wm.lower_temp, wm.upper_temp, wm.bucket_type, wm.bucket_unit,
+       ob.yes_bid, ob.yes_ask, ob.yes_mid, ob.yes_bid_size, ob.yes_ask_size, ob.spread
 FROM ob_snapshots ob
 JOIN weather_markets wm ON ob.condition_id = wm.condition_id
 WHERE wm.city = ? AND wm.settlement_date = ?
-ORDER BY ob.ts_utc, wm.temp_c
+ORDER BY ob.ts_utc, wm.lower_temp
 ```
 
 **Important**: `snapshot_label` is nullable. Every 2-minute raw snapshot is stored regardless.
@@ -339,7 +390,8 @@ CREATE TABLE wx_observations (
                                            -- trading close; settlement = full day high)
     is_in_peak_window INTEGER DEFAULT 0,  -- 1 if this reading is during the city's
                                            -- typical afternoon peak hours (Type A/B/C aware)
-    source          TEXT DEFAULT 'metar'
+    source          TEXT DEFAULT 'metar',
+    raw_payload_json TEXT                  -- raw source observation for audit/replay
 );
 CREATE UNIQUE INDEX IF NOT EXISTS ix_wx_obs_unique
     ON wx_observations(station, source, observed_utc);
@@ -359,6 +411,7 @@ CREATE TABLE taf_forecasts (
     tn_c            REAL,                  -- forecast daily min
     tn_time_utc     TEXT,
     raw_taf         TEXT,
+    raw_payload_json TEXT,
     UNIQUE(station, issued_utc)
 );
 
@@ -376,35 +429,45 @@ CREATE TABLE model_forecasts (
     low_c           REAL,
     lat             REAL,
     lon             REAL,
+    model_run_is_estimated INTEGER DEFAULT 1,
+    raw_payload_json TEXT,
     UNIQUE(station, model, model_run_utc, forecast_date)
 );
 
--- Polymarket weather markets (refreshed daily by discover_markets.py)
+-- Polymarket weather markets (refreshed daily by rules-first discovery)
 CREATE TABLE weather_markets (
     condition_id            TEXT PRIMARY KEY,
+    event_slug              TEXT,
+    market_slug             TEXT,
     city                    TEXT NOT NULL,
     station                 TEXT NOT NULL,
     settlement_date         TEXT NOT NULL,   -- YYYY-MM-DD in station's local timezone
-    bucket_type             TEXT NOT NULL,   -- 'exact' | 'above_eq' | 'below_eq'
-    temp_c                  REAL,
+    bucket_type             TEXT NOT NULL,   -- 'exact' | 'range' | 'above_eq' | 'below_eq'
+    lower_temp              REAL,
+    upper_temp              REAL,
+    bucket_unit             TEXT NOT NULL,   -- 'C' | 'F'
+    settlement_unit         TEXT NOT NULL,   -- 'C' | 'F'
     yes_token_id            TEXT,
     no_token_id             TEXT,
     question                TEXT,
     rules_text              TEXT,            -- raw resolution rules from Polymarket
     rules_source            TEXT,            -- named source in rules (e.g. 'Weather Underground')
+    resolution_source_type  TEXT,            -- wunderground_daily | hong_kong_observatory_daily |
+                                             -- noaa_wrh_timeseries | unknown
     resolution_source_url   TEXT,            -- exact URL named in rules
+    raw_market_json         TEXT,            -- raw Gamma market payload for audit/replay
     first_seen_utc          TEXT,            -- when discover_markets.py first found this market
     close_time_utc          TEXT,            -- settlement UTC time from Polymarket end_date
-    settlement_temp_c_proxy REAL,            -- Q2: METAR daily high at close time (fast proxy)
-    settlement_temp_c_final REAL,            -- Q2: Polymarket/UMA resolved outcome (final truth)
+    settlement_value_proxy  REAL,            -- Q2: normalized proxy source value in settlement_unit
+    settlement_value_final  REAL,            -- Q2: final Polymarket/UMA resolved value/outcome
     settlement_source       TEXT,            -- which source was used for proxy settlement
     settlement_rounding_rule TEXT,           -- Q2: how Polymarket rounds fractional temps
                                              --     'round' | 'floor' | 'ceiling' | unknown
-                                             --     METAR reports 21.7C; bucket is integer 22C
+                                             --     source reports 21.7C; bucket is integer 22C
                                              --     must apply same rule or proxy match fails
     -- settlement_window_hours REMOVED — was based on wrong model.
     -- Trading close (12:00 UTC) ≠ temperature measurement end.
-    -- Resolution = WU full local calendar day per market rules.
+    -- Resolution = full source-specific local calendar day per market rules.
     resolution_status       TEXT,            -- 'proxy_only' | 'confirmed' | 'disputed'
     settled_at_utc          TEXT,            -- when settle_markets.py ran for this market
     active                  INTEGER DEFAULT 1,
@@ -418,9 +481,15 @@ CREATE TABLE ob_snapshots (
     ts_utc          TEXT NOT NULL,
     yes_bid         REAL,
     yes_ask         REAL,
+    yes_bid_size    REAL,
+    yes_ask_size    REAL,
     no_bid          REAL,
     no_ask          REAL,
+    no_bid_size     REAL,
+    no_ask_size     REAL,
     yes_mid         REAL,
+    spread          REAL,
+    raw_book_json   TEXT,                   -- raw CLOB book for depth/executability analysis
     hours_to_close  REAL,                   -- computed at capture time
     snapshot_label  TEXT                    -- nullable: 'open'|'T-24h'|'T-12h'|'T-6h'|
                                             --          'T-3h'|'T-1h'|'T-30m'|'close'
@@ -450,6 +519,34 @@ CREATE TABLE alerts (
     alert_type  TEXT NOT NULL,              -- neg_risk_gap | obs_mismatch | forecast_divergence | convergence
     detail_json TEXT
 );
+
+-- Normalized settlement-source observations (WU/HKO/NOAA/etc.)
+CREATE TABLE settlement_observations (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    condition_id    TEXT,
+    city            TEXT NOT NULL,
+    station         TEXT,
+    source_name     TEXT NOT NULL,
+    source_type     TEXT NOT NULL,
+    source_url      TEXT,
+    local_date      TEXT NOT NULL,
+    value           REAL,
+    unit            TEXT,
+    precision       TEXT,
+    fetched_utc     TEXT NOT NULL,
+    raw_payload_json TEXT
+);
+
+-- Final market resolution from Polymarket/UMA
+CREATE TABLE market_resolutions (
+    condition_id     TEXT PRIMARY KEY,
+    resolved_outcome TEXT,
+    resolved_value   REAL,
+    resolved_unit    TEXT,
+    resolution_status TEXT,
+    resolved_at_utc  TEXT,
+    raw_payload_json TEXT
+);
 ```
 
 ---
@@ -460,17 +557,18 @@ CREATE TABLE alerts (
 polymarket-weather/
 ├── scripts/
 │   ├── init_db.py              # Single schema owner — all scripts call this first
-│   ├── discover_markets.py     # Scrape Polymarket daily; set first_seen_utc, close_time_utc,
-│   │                           # rules_source, resolution_source_url per market
+│   ├── discover_markets.py     # Gamma/rules-first discovery; set first_seen_utc,
+│   │                           # close_time_utc, source adapter, units, bucket ranges
 │   ├── log_orderbooks.py       # Poll CLOB every 2 min; compute hours_to_close;
-│   │                           # assign snapshot_label near standard thresholds
+│   │                           # assign snapshot_label; store size/depth/raw book
 │   ├── fetch_weather.py        # METAR + TAF + 5 NWP models; scheduled loop
-│   ├── settle_markets.py       # Runs 30min after close_time_utc per city; writes
-│   │                           # settlement_temp_c_proxy + settlement_temp_c_final
+│   ├── fetch_settlement_sources.py # WU/HKO/NOAA source adapters
+│   ├── settle_markets.py       # Runs after source-specific finalization; writes
+│   │                           # settlement_value_proxy + final resolution
 │   └── neg_risk_scanner.py     # "above X°C" vs bucket sum + obs mismatch alerts
 ├── data/
-│   └── city_stations.json      # Single source of truth: city, station, lat, lon,
-│                               # timezone, country, wu_path, anomaly flags
+│   └── city_stations.json      # Enriched cache: city, slug, station, lat, lon,
+│                               # timezone, unit, country, source metadata
 ├── logs/
 │   └── research/
 ├── weather.db
@@ -630,14 +728,20 @@ local_date = close_dt.date().isoformat()
 **The rounding problem**: METAR observations can report fractional degrees (e.g. 21.7°C).
 Market buckets are whole integers. Polymarket applies a rounding rule at settlement —
 but that rule is not stored anywhere in this system. If METAR daily high = 21.7°C, the
-Q2 CASE expression with `bucket_type = 'exact' AND settlement_temp_c_proxy = 21.7` will
+Q2 CASE expression with `bucket_type = 'exact' AND settlement_value_proxy = 21.7` will
 never match any bucket. The resolved bucket will appear as NO for everything, which is wrong.
 
 Fix: add `settlement_rounding_rule` to `weather_markets` (e.g. `'round'` / `'floor'` /
 `'ceiling'`). Parse it from the market's rules text. Apply it when writing
-`settlement_temp_c_proxy` so the stored value is already rounded to the integer the
+`settlement_value_proxy` so the stored value is already rounded to the integer the
 market will use. Until this is known, flag proxy settlements as `resolution_status =
 'proxy_only'` and do not treat them as confirmed.
+
+**The unit/range problem**: Not all markets are integer Celsius exact buckets. US markets
+can use Fahrenheit range buckets (`68-69°F`), and Hong Kong rules can use one decimal
+Celsius. Resolution logic must normalize source values into `settlement_unit`, then compare
+against `lower_temp`/`upper_temp` in `bucket_unit`. If units differ, convert explicitly and
+store both raw and normalized values.
 
 ### Q3: order book timeline
 
@@ -661,6 +765,10 @@ first runs 36 hours before settlement (instead of 48h), the "open" snapshot is a
 not T-48h. The data is honest — it reflects what we first observed — but queries
 that assume "open = T-48h" will be misleading. Always present `first_seen_utc` alongside
 `snapshot_label = 'open'` in analysis output so the actual discovery lag is visible.
+
+**Executability requirement**: every orderbook snapshot must include size/depth and raw
+book JSON. Midpoint-only analysis is insufficient for strategy testing because many apparent
+edges disappear at executable bid/ask size.
 
 ### Safe query patterns
 
@@ -707,6 +815,9 @@ WHERE DATE(ts_utc) = DATE('now')               -- server UTC, not station local
 | city_stations.json | ⚠️ Incomplete | Missing `timezone`, `lat`, `lon` fields |
 | wx_observations schema | ❌ Old schema | Missing `observed_utc`, `local_date`, `fetched_utc` |
 | Polymarket close_time_utc | ⚠️ Unclear | end_date is date-only; no time component found |
+| rules/source adapters | ❌ Missing | WU/HKO/NOAA/final outcome adapters not built |
+| unit/range parser | ❌ Missing | Fahrenheit ranges and decimal-C sources not supported |
+| orderbook depth | ❌ Missing | sizes/raw book not stored |
 
 **Critical findings from audit:**
 
@@ -716,7 +827,7 @@ Required columns: `id, station, city, observed_utc, fetched_utc, local_date, tem
 `ts_utc` is storing fetch time, not observation time. `observed_utc` and `local_date` not present.
 
 **2. city_stations.json missing timezone, lat, lon**
-The plan designates it as single source of truth but it currently only has:
+The plan designates it as the enriched metadata cache but it currently only has:
 `city, slug, station, country, wu_path, anomaly, anomaly_note`
 Missing: `timezone, lat, lon`
 All scripts that need these fields (fetch_weather.py, settle_markets.py) hardcode them instead.
@@ -740,7 +851,7 @@ Actual rules text scraped from live NYC market:
 | Clock | What it controls | Value |
 |-------|-----------------|-------|
 | **Trading clock** | When positions lock | 12:00 UTC on named date |
-| **Temperature clock** | What temperature is used | WU full local calendar day (midnight to midnight local) |
+| **Temperature clock** | What temperature is used | Full local calendar day from the market's named source |
 
 NYC trading closes at 08:00 EDT — 7 hours before the typical afternoon peak. But the
 resolution temperature is the full local calendar day. Polymarket's UMA resolver checks
@@ -757,7 +868,7 @@ Correct settle_markets.py fire times per city (~2h after local midnight):
 | Seoul / Tokyo | 15:00 UTC same day | ~17:00 UTC same day |
 | Wellington | 12:00 UTC same day | ~14:00 UTC same day |
 | Beijing / Shenzhen / Guangzhou / Singapore | 16:00 UTC same day | ~18:00 UTC same day |
-| Helsinki (Moscow*) | 21:00 UTC same day | ~23:00 UTC same day |
+| Moscow / NOAA UUWW | 21:00 UTC same day | ~23:00 UTC same day |
 | Madrid | 22:00 UTC same day | ~00:00 UTC next day |
 | London | 23:00 UTC same day | ~01:00 UTC next day |
 | NYC / Miami | 04:00 UTC next day | ~06:00 UTC next day |
@@ -783,12 +894,14 @@ June 1 everywhere except Pacific/Auckland which was already June 1 local).
 This will fail silently when fetches happen near UTC midnight for UTC+ stations.
 
 **Checklist:**
-- [x] 17 city markets / 16 unique settlement stations identified and mapped
+- [x] 17-market pilot identified, with live-rule caveats for HKO/NOAA/Fahrenheit markets
 - [x] METAR fetch working — 16 stations responding, temperatures correct
 - [x] TAF fetch working — TX/TN parsed for 5 stations, issued/valid timestamps in UTC
 - [x] GFS via open-meteo — 48 rows confirmed
 - [x] Retry logic + fetch_log logging correctly
 - [ ] **Fix city_stations.json**: add `timezone`, `lat`, `lon` for all 17 entries
+- [ ] **Rules-first discovery**: treat Gamma market rules as authority; refresh source,
+      units, precision, bucket type/range, and station/source metadata from live rules
 - [ ] **Fix wx_observations schema**: add `observed_utc`, `local_date`, `fetched_utc`;
       store METAR `reportTime` as `observed_utc`; compute `local_date` from that
       using station timezone; keep `fetched_utc` as when system retrieved it
@@ -802,9 +915,12 @@ This will fail silently when fetches happen near UTC midnight for UTC+ stations.
 - [ ] ECMWF direct via `ecmwf-opendata` (3h faster than open-meteo mirror)
 - [ ] `discover_markets.py` refined: populate `weather_markets` table with
       `first_seen_utc`, `close_time_utc`, `rules_source`, `resolution_source_url`,
-      `settlement_rounding_rule`
-- [ ] `log_orderbooks.py`: compute `hours_to_close`, assign nullable `snapshot_label`
-- [ ] `settle_markets.py`: write proxy and final settlement, apply rounding rule
+      `settlement_rounding_rule`, units, bucket ranges, and raw market JSON
+- [ ] `log_orderbooks.py`: compute `hours_to_close`, assign nullable `snapshot_label`,
+      store sizes/depth/spread/raw book JSON
+- [ ] Add `fetch_settlement_sources.py`: WU, Hong Kong Observatory, NOAA WRH adapters
+- [ ] `settle_markets.py`: write proxy and final settlement, apply unit conversion,
+      precision, bucket-aware logic, and final Polymarket/UMA reconciliation
 - [ ] Full scheduled loop running continuously
 
 ### Phase 2 — Gap detection
@@ -814,18 +930,18 @@ This will fail silently when fetches happen near UTC midnight for UTC+ stations.
 - [ ] End-of-day convergence: last 60 min, obvious NO entries
 
 ### Phase 3 — Analysis (after 2+ weeks of data)
-- [ ] Which forecast model best predicts actual METAR settlement reading?
-- [ ] Do HK (ZBAA) and Moscow (EFHK) anomalies create systematic mispricings?
+- [ ] Which forecast model best predicts final settlement-source readings?
+- [ ] Do HKO Hong Kong and NOAA Moscow source differences create systematic mispricings?
 - [ ] Does model disagreement predict market mispricing?
 - [ ] How often do neg-risk gaps appear, and how long do they last?
-- [ ] Does WU data lag vs real-time METAR create a tradeable window?
+- [ ] Does settlement-source lag vs fast proxy data create a tradeable window?
 
 ---
 
 ## Key Open Questions
 
-1. Which settlement source does each market actually name in its rules? (Must scrape per-market)
-2. How much does WU final daily summary differ from raw METAR daily high? (Need to measure)
+1. Which settlement source does each market actually name in its rules? (Must fetch per-market)
+2. How much do settlement-source final values differ from fast proxy highs? (Need to measure)
 3. Which cities have the most market liquidity and tradeable spreads?
 4. Does ECMWF direct beat open-meteo ECMWF by enough to matter for daily high forecasts?
-5. Are HK and Moscow anomaly markets priced on the correct station or the wrong one?
+5. Are HKO/NOAA source-specific markets priced as if traders assume the wrong station/source?
