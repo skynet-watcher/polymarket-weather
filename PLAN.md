@@ -430,7 +430,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS ix_wx_obs_unique
     ON wx_observations(station, source, observed_utc);
 CREATE INDEX IF NOT EXISTS ix_wx_station_date ON wx_observations(station, local_date);
 
--- TAF aviation forecasts (TX/TN where available; only 5 of 16 stations include temp)
+-- TAF aviation forecasts (TX/TN where available; only a subset of stations include temp)
 CREATE TABLE taf_forecasts (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     station         TEXT NOT NULL,
@@ -755,13 +755,13 @@ This handles all cities including Wellington (UTC+12 → midnight) without speci
 **The settlement lookup**: `MAX(temp_c) WHERE station=? AND local_date=?`
 
 `settle_markets.py` runs ~2h after local midnight (when the local calendar day is
-complete and WU has had time to finalize). The daily high covers the full local calendar
+complete and the named settlement source has had time to finalize). The daily high covers the full local calendar
 day — midnight to midnight local — matching the rules language: "highest temperature
 recorded for all times on this day."
 
 Do NOT add `AND observed_utc <= close_time_utc`. Trading closure at 12:00 UTC does
 not end the temperature measurement window. Polymarket resolves after local midnight
-using the finalized full-day WU reading.
+using the finalized full-day reading from the market's named source.
 
 The `local_date` to query — use the canonical derivation above (same as `settlement_date`):
 ```python
@@ -845,6 +845,33 @@ WHERE DATE(ts_utc) = DATE('now')               -- server UTC, not station local
 
 ---
 
+## Testability Matrix
+
+Every planned test must map to fields captured at collection time. If a required field is
+missing, the test is not allowed to produce a strategy conclusion.
+
+| Test | Required captured data |
+|------|------------------------|
+| Resolution source mismatch audit | `weather_markets.rules_text`, `rules_source`, `resolution_source_type`, `settlement_observations.value/unit/raw_payload_json`, `wx_observations.daily_high_c`, `market_resolutions.resolved_outcome/resolved_value` |
+| Liquidity / executability filter | `ob_snapshots.yes_bid/yes_ask/no_bid/no_ask`, all size fields, `spread`, `raw_book_json`, `hours_to_close` |
+| Already priced in | source `observed_utc` or model valid/run time, `fetched_utc`, first `ob_snapshots.ts_utc` after fetch, pre-fetch and post-fetch price deltas |
+| Data delay / source latency | source valid/publish time where available, system `fetched_utc`, first DB insert/change time, first orderbook snapshot after fetch |
+| Forecast revision momentum | `model_forecasts.model`, `model_run_utc`, `model_run_is_estimated`, `fetched_utc`, `forecast_date`, `high_c/low_c`, orderbook snapshots after each revision |
+| Stale observation strategy | `wx_observations.observed_utc/fetched_utc/local_date/daily_high_c`, trading `close_time_utc`, bucket lower/upper/unit, executable orderbook snapshot |
+| Market-open forecast accuracy | `weather_markets.first_seen_utc`, `model_forecasts.fetched_utc <= first_seen_utc`, opening bucket prices, final settlement value |
+| Forecast consensus vs market | all model forecasts for same station/local_date, opening or selected-time market distribution, final settlement value |
+| Best forecast timing by station | forecast `fetched_utc`, `model_run_utc`, `hours_before_close`, station timezone/local date, final settlement value |
+| Dynamic rebalancing | full sequence of forecasts, observations, settlement-source updates, orderbook snapshots, and simulated position events |
+| Negative-risk gaps | `weather_markets.neg_risk_market_id`, bucket lower/upper/unit/type, executable prices/sizes for every bucket in group |
+| Local-time weather path | `wx_observations.local_hour`, `is_in_peak_window`, station timezone, orderbook repricing after local milestones |
+| Station reliability | forecast error, proxy/source mismatch rate, intraday volatility, late-day new highs, liquidity/spread/repricing metrics |
+| Bucket adjacency / hedge quality | bucket intervals, neg-risk group, executable bid/ask/size, settlement outcome, capital-at-risk model |
+
+This matrix is the build contract. `scripts/init_db.py` must create every field needed here,
+and analysis scripts should fail loudly when required data is absent.
+
+---
+
 ## Phase Plan
 
 ### Phase 1 — Data collection (in progress)
@@ -853,32 +880,32 @@ WHERE DATE(ts_utc) = DATE('now')               -- server UTC, not station local
 
 | Component | Status | Finding |
 |-----------|--------|---------|
-| METAR fetch | ✅ Collecting | 16 stations, all responding |
+| METAR fetch | ✅ Collecting | 17 stations responding; latest rows include observed/fetched UTC and station-local date |
 | TAF fetch | ✅ Collecting | 15 TAFs, Seoul TX=31°C confirmed |
-| GFS model | ✅ Collecting | 48 rows (16 stations × 3 days) |
+| GFS model | ✅ Collecting | 51 latest rows (17 stations × 3 local forecast dates); historical DB now has 99 rows |
 | ICON, MF, GEM | ❌ Not yet run | Only GFS fetched so far |
 | ECMWF direct | ❌ Not built | Still using open-meteo for ECMWF |
-| weather_markets table | ❌ Missing | discover_markets.py not producing rows |
-| ob_snapshots table | ❌ Missing | log_orderbooks.py not running |
-| city_stations.json | ⚠️ Incomplete | Missing `timezone`, `lat`, `lon` fields |
-| wx_observations schema | ❌ Old schema | Missing `observed_utc`, `local_date`, `fetched_utc` |
+| weather_markets table | ✅ Populated | 187 markets across 17 city/date events; rules/source/unit/token/close fields verified non-null |
+| ob_snapshots table | ✅ Populated | Complete 187-market live snapshot saved with sizes, spread, raw books, hours-to-close, and labels |
+| city_stations.json | ✅ Enriched | `timezone`, `lat`, `lon`, units, proxy station, and source metadata present for all 17 cities |
+| wx_observations schema | ✅ Migrated | `observed_utc`, `fetched_utc`, `local_date`, `local_hour`, raw payload, and local-day highs stored |
 | Polymarket close_time_utc | ✅ Confirmed | 12:00 UTC universal — scraped from settled markets |
 | rules/source adapters | ❌ Missing | WU/HKO/NOAA/final outcome adapters not built |
-| unit/range parser | ❌ Missing | Fahrenheit ranges and decimal-C sources not supported |
-| orderbook depth | ❌ Missing | sizes/raw book not stored |
+| unit/range parser | ✅ Built | Exact C buckets, Fahrenheit range buckets, and floor/ceiling buckets parsed |
+| orderbook depth | ✅ Built | Best prices, best sizes, spread, raw YES/NO books, and timing labels stored |
 
 **Critical findings from audit:**
 
-**1. Schema is stale — wx_observations has wrong columns**
-Current columns: `id, station, city, ts_utc, temp_c, daily_high_c, source`
-Required columns: `id, station, city, observed_utc, fetched_utc, local_date, temp_c, daily_high_c, source`
-`ts_utc` is storing fetch time, not observation time. `observed_utc` and `local_date` not present.
+**1. Schema is now centralized and migrated**
+`scripts/init_db.py` is the single schema owner. Legacy local databases may still contain
+older compatibility columns such as `ts_utc`, but current writes populate the canonical
+analysis fields: `observed_utc`, `fetched_utc`, `local_date`, `local_hour`,
+`daily_high_c`, `source`, and `raw_payload_json`.
 
-**2. city_stations.json missing timezone, lat, lon**
-The plan designates it as the enriched metadata cache but it currently only has:
-`city, slug, station, country, wu_path, anomaly, anomaly_note`
-Missing: `timezone, lat, lon`
-All scripts that need these fields (fetch_weather.py, settle_markets.py) hardcode them instead.
+**2. city_stations.json is now the runtime metadata cache**
+It contains `city`, `slug`, `station`, `country`, `lat`, `lon`, `timezone`,
+bucket/settlement units, source type/name/URL, WU paths where relevant, and anomaly notes.
+`fetch_weather.py` loads this file directly; live market rules still remain authoritative.
 
 **3. Settlement time and temperature window — two separate clocks**
 
@@ -961,34 +988,34 @@ June 1 everywhere except Pacific/Auckland which was already June 1 local).
 This will fail silently when fetches happen near UTC midnight for UTC+ stations.
 
 **Checklist:**
-- [x] 17-market pilot identified, with live-rule caveats for HKO/NOAA/Fahrenheit markets
-- [x] METAR fetch working — 16 stations responding, temperatures correct
+- [x] 17-city pilot identified, with live-rule caveats for HKO/NOAA/Fahrenheit markets
+- [x] METAR fetch working — 17 stations responding, temperatures and local-day highs correct
 - [x] TAF fetch working — TX/TN parsed for 5 stations, issued/valid timestamps in UTC
-- [x] GFS via open-meteo — 48 rows confirmed
+- [x] GFS via open-meteo — 51 latest rows confirmed for 17 stations × 3 local forecast dates
 - [x] Retry logic + fetch_log logging correctly
-- [ ] **Fix city_stations.json**: add `timezone`, `lat`, `lon` for all 17 entries;
+- [x] **Fix city_stations.json**: add `timezone`, `lat`, `lon` for all 17 entries;
       update Moscow from EFHK → UUWW; update Hong Kong from ZBAA → VHHH
-- [ ] **Rules-first discovery**: treat Gamma market rules as authority; refresh source,
+- [x] **Rules-first discovery**: treat Gamma market rules as authority; refresh source,
       units, precision, bucket type/range, and station/source metadata from live rules
-- [ ] **Sync fetch_weather.py**: update STATIONS dict to use UUWW (Moscow) and
+- [x] **Sync fetch_weather.py**: update STATIONS dict to use UUWW (Moscow) and
       VHHH (Hong Kong); load all station metadata from city_stations.json
-- [ ] **Fix wx_observations schema**: add `observed_utc`, `local_date`, `fetched_utc`;
+- [x] **Fix wx_observations schema**: add `observed_utc`, `local_date`, `fetched_utc`;
       store METAR `reportTime` as `observed_utc`; compute `local_date` from that
       using station timezone; keep `fetched_utc` as when system retrieved it
-- [ ] **Fix daily high query**: use `(station, local_date)` not `DATE(ts_utc)`
+- [x] **Fix daily high query**: use `(station, local_date)` not `DATE(ts_utc)`
 - [x] **Polymarket settlement time confirmed**: 12:00 UTC universal for all weather markets
       (scraped from settled Seoul/NYC markets: `end_date_iso = '2026-MM-DDT12:00:00Z'`)
-- [ ] **Fix open-meteo timezone**: pass `timezone=<station tz>` per model request
+- [x] **Fix open-meteo timezone**: pass `timezone=<station tz>` per model request
       so `forecast_date` is in station's local calendar, not UTC
 - [ ] **Run ICON, MF, GEM**: only GFS collected so far
-- [ ] Create `scripts/init_db.py` as single schema owner; apply new schema
+- [x] Create `scripts/init_db.py` as single schema owner; apply new schema
 - [ ] ECMWF direct via `ecmwf-opendata` (3h faster than open-meteo mirror)
-- [ ] `discover_markets.py` refined: populate `weather_markets` table including
+- [x] `discover_markets.py` refined: populate `weather_markets` table including
       confirmed CLOB fields: `game_start_time_utc`, `neg_risk_market_id`,
       `neg_risk_request_id`, `accepting_order_ts_utc`; set `close_time_utc` from
       Gamma `endDate` (T12:00:00Z); store `rules_source`, `resolution_source_url`,
       `settlement_rounding_rule`, units, bucket ranges, and raw market JSON
-- [ ] `log_orderbooks.py`: compute `hours_to_close`, assign nullable `snapshot_label`,
+- [x] `log_orderbooks.py`: compute `hours_to_close`, assign nullable `snapshot_label`,
       store sizes/depth/spread/raw book JSON
 - [ ] Add `fetch_settlement_sources.py`: WU, Hong Kong Observatory, NOAA WRH adapters
 - [ ] `settle_markets.py`: write proxy and final settlement, apply unit conversion,
