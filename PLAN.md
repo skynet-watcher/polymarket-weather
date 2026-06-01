@@ -30,7 +30,7 @@ authority. The authority is the per-market rules text and resolution source.
 | City        | Fast Proxy Station | Expected Source / Station      | Timezone         | Notes                         |
 |-------------|--------------------|--------------------------------|------------------|-------------------------------|
 | Seoul       | RKSI               | Incheon International          | Asia/Seoul       |                               |
-| Hong Kong   | HKO/HKO            | Hong Kong Observatory          | Asia/Hong_Kong   | Rules source is HKO Daily Extract, not WU/ZBAA |
+| Hong Kong   | VHHH               | Hong Kong Observatory (HKO)    | Asia/Hong_Kong   | Settlement: HKO Daily Extract. Fast proxy: VHHH (HK Int'l Airport, nearest ICAO, ~13km from HKO) |
 | London      | EGLC               | London City Airport            | Europe/London    |                               |
 | Tokyo       | RJTT               | Haneda Airport                 | Asia/Tokyo       |                               |
 | NYC         | KLGA               | LaGuardia Airport              | America/New_York | Fahrenheit range buckets       |
@@ -826,7 +826,7 @@ WHERE DATE(ts_utc) = DATE('now')               -- server UTC, not station local
 | ob_snapshots table | ❌ Missing | log_orderbooks.py not running |
 | city_stations.json | ⚠️ Incomplete | Missing `timezone`, `lat`, `lon` fields |
 | wx_observations schema | ❌ Old schema | Missing `observed_utc`, `local_date`, `fetched_utc` |
-| Polymarket close_time_utc | ⚠️ Unclear | end_date is date-only; no time component found |
+| Polymarket close_time_utc | ✅ Confirmed | 12:00 UTC universal — scraped from settled markets |
 | rules/source adapters | ❌ Missing | WU/HKO/NOAA/final outcome adapters not built |
 | unit/range parser | ❌ Missing | Fahrenheit ranges and decimal-C sources not supported |
 | orderbook depth | ❌ Missing | sizes/raw book not stored |
@@ -912,9 +912,12 @@ This will fail silently when fetches happen near UTC midnight for UTC+ stations.
 - [x] TAF fetch working — TX/TN parsed for 5 stations, issued/valid timestamps in UTC
 - [x] GFS via open-meteo — 48 rows confirmed
 - [x] Retry logic + fetch_log logging correctly
-- [ ] **Fix city_stations.json**: add `timezone`, `lat`, `lon` for all 17 entries
+- [ ] **Fix city_stations.json**: add `timezone`, `lat`, `lon` for all 17 entries;
+      update Moscow from EFHK → UUWW; update Hong Kong from ZBAA → VHHH
 - [ ] **Rules-first discovery**: treat Gamma market rules as authority; refresh source,
       units, precision, bucket type/range, and station/source metadata from live rules
+- [ ] **Sync fetch_weather.py**: update STATIONS dict to use UUWW (Moscow) and
+      VHHH (Hong Kong); load all station metadata from city_stations.json
 - [ ] **Fix wx_observations schema**: add `observed_utc`, `local_date`, `fetched_utc`;
       store METAR `reportTime` as `observed_utc`; compute `local_date` from that
       using station timezone; keep `fetched_utc` as when system retrieved it
