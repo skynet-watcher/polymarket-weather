@@ -399,6 +399,89 @@ polymarket-weather/
 
 ---
 
+## Timestamp Design — Rationale
+
+Every timestamp in the system must answer exactly one question. Conflating two questions
+into one field causes silent data corruption that is hard to find later.
+
+### The five timestamp questions this system needs to answer
+
+| Question | Field | Where stored |
+|----------|-------|-------------|
+| When did the station instrument take this reading? | `observed_utc` | `wx_observations` |
+| When did our system retrieve it? | `fetched_utc` | `wx_observations`, `taf_forecasts`, `model_forecasts`, `fetch_log` |
+| What local calendar day does this reading belong to? | `local_date` | `wx_observations`, `model_forecasts` |
+| Which model run produced this forecast? | `model_run_utc` | `model_forecasts` |
+| When was this market first visible to us? | `first_seen_utc` | `weather_markets` |
+
+### Why each one matters and what goes wrong without it
+
+**`observed_utc` vs `fetched_utc` — do not merge these**
+
+A METAR observation at Tokyo RJTT is taken at, say, 08:30 JST (23:30 UTC the day before).
+Our poller runs 25 minutes later and fetches it at 23:55 UTC. If we store the fetch time
+as the observation time, every downstream query that asks "what was the temperature at X time"
+is off by up to 30 minutes. Over a day of 48 polls, this compounds into a blurry, shifted
+picture of how temperatures evolved. The actual observation time is in the METAR `reportTime`
+field and must be stored as `observed_utc`. The fetch time goes in `fetched_utc`. Both matter
+for different questions.
+
+**`local_date` — never use `DATE(ts_utc)` or `dt.date.today()` for station day boundaries**
+
+The daily high for a weather market is the highest temperature reached during the local
+calendar day at that station. UTC date boundaries do not match local calendar days for
+any non-UTC station.
+
+Tokyo (UTC+9): after 15:00 UTC, `DATE(ts_utc)` returns "tomorrow" while Tokyo is still
+the same day. The daily high computation resets 9 hours too early. Wellington (UTC+12/+13)
+is worse — most of its afternoon falls into the wrong UTC date. For Auckland in summer
+(UTC+13), 11 hours of the local day are on the "previous" UTC date.
+
+The correct approach: convert `observed_utc` to the station's local timezone, extract the
+date, store it as `local_date`, and group daily highs by `(station, local_date)`.
+
+All 17 city timezones are stored in `data/city_stations.json` and loaded at runtime.
+No script should use `dt.date.today()` or `DATE(column)` for station-local day logic.
+
+**`model_run_utc` — estimate vs ground truth**
+
+For open-meteo models, `model_run_utc` is estimated from the known run schedule plus
+the configured fetch offset. This is a reasonable approximation but will be wrong when
+a model run is delayed (common with GFS). It should be labelled as an estimate in queries
+and never used as proof of which run was ingested. For ECMWF direct, the actual run time
+is in the GRIB2 metadata and should be extracted directly.
+
+**`forecast_date` — must use station's local timezone, not UTC**
+
+open-meteo returns forecast dates in whatever timezone is requested. If no timezone is
+passed (the current bug), open-meteo defaults to UTC. A forecast for "tomorrow" in Tokyo
+returned as `2026-06-02` is correct if today is June 1 in Tokyo — but the server may
+be in UTC where it is still June 1. The mismatch is worst at the UTC day boundary for
+stations in UTC+12/+13. The fix: pass `timezone=<station tz>` per request, so dates in
+the response are already in the station's local calendar.
+
+**`first_seen_utc` — honest about what we know**
+
+We do not have access to Polymarket's internal market creation timestamp. `first_seen_utc`
+is when `discover_markets.py` first encountered the market in a scrape. It is a proxy for
+market open, not the actual open. It is the correct field to use for Q1 ("what forecasts
+were available at open?") because it bounds what this system could have known. If
+Polymarket ever exposes a true creation timestamp via the Gamma API, it should go in a
+separate field rather than overwriting `first_seen_utc`.
+
+### Timestamp rules for all scripts
+
+1. Always use `datetime.now(timezone.utc)` — never `datetime.now()` (timezone-naive)
+2. Always store `observed_utc` from the source field (`reportTime` for METAR), never
+   substitute fetch time
+3. Always compute `local_date` from `observed_utc` + station timezone — never from
+   `dt.date.today()` or `DATE(ts_utc)`
+4. Always pass station timezone to open-meteo so response dates are local, not UTC
+5. Label estimated timestamps (e.g. `model_run_utc` from schedule offsets) in comments
+   so future queries know not to treat them as authoritative
+
+---
+
 ## Phase Plan
 
 ### Phase 1 — Data collection (in progress)
@@ -407,8 +490,12 @@ polymarket-weather/
 - [x] TAF fetch working — TX/TN parsed for 5 stations
 - [x] GFS, ICON, Météo-France, GEM via open-meteo — all confirmed
 - [x] Retry logic + fetch_log with exact timestamps and duration
-- [ ] Add `timezone`, `lat`, `lon` to `data/city_stations.json`; refactor all scripts to load from there
-- [ ] Fix daily high to use `local_date` (station timezone), not `DATE(ts_utc)`
+- [ ] **Timestamp fixes** (critical — do before trusting any collected data):
+      - Add `timezone`, `lat`, `lon` to `data/city_stations.json`; load in all scripts
+      - Store `observed_utc` from METAR `reportTime`, separate from `fetched_utc`
+      - Compute `local_date` from `observed_utc` + station timezone; use for daily high grouping
+      - Pass station timezone to open-meteo so `forecast_date` is in local calendar
+      - Replace all `dt.datetime.now()` with `dt.datetime.now(dt.timezone.utc)`
 - [ ] Create `scripts/init_db.py` as single schema owner
 - [ ] ECMWF direct via `ecmwf-opendata` (replace open-meteo ECMWF — 3h faster)
 - [ ] `discover_markets.py` refined: set `first_seen_utc`, `close_time_utc`,
