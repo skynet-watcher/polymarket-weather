@@ -1,0 +1,190 @@
+{% extends "base.html" %}
+{% block title %}Health · Polymarket Weather{% endblock %}
+
+{% block extra_head %}
+<style>
+.health-grid { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
+@media(max-width:900px) { .health-grid { grid-template-columns:1fr; } }
+.station-grid { display:grid; grid-template-columns:repeat(3,1fr); gap:8px; }
+@media(max-width:700px) { .station-grid { grid-template-columns:repeat(2,1fr); } }
+.station-item { background:var(--bg); border-radius:6px; padding:8px 10px; }
+.station-name { font-size:12px; font-weight:600; font-family:monospace; }
+.station-time { font-size:11px; color:var(--muted); }
+.stat-row { display:flex; gap:14px; margin-bottom:20px; flex-wrap:wrap; }
+.stat-box { background:var(--surface); border:1px solid var(--border); border-radius:8px;
+             padding:14px 18px; flex:1; min-width:100px; text-align:center; }
+.stat-val { font-size:26px; font-weight:700; }
+.stat-lbl { font-size:11px; color:var(--muted); margin-top:2px; }
+</style>
+{% endblock %}
+
+{% block content %}
+{% set h = h %}
+<div class="page-header">
+  <h1>Data Health</h1>
+  <p>{{ h.generated_at }}</p>
+</div>
+
+{# Summary stats #}
+<div class="stat-row">
+  <div class="stat-box">
+    <div class="stat-val">{{ h.total_markets }}</div>
+    <div class="stat-lbl">Active markets</div>
+  </div>
+  <div class="stat-box">
+    <div class="stat-val">{{ h.total_snaps }}</div>
+    <div class="stat-lbl">OB snapshots</div>
+  </div>
+  <div class="stat-box">
+    <div class="stat-val {% if h.open_alerts > 0 %}text-yellow{% else %}text-green{% endif %}">
+      {{ h.open_alerts }}
+    </div>
+    <div class="stat-lbl">Open alerts</div>
+  </div>
+  <div class="stat-box">
+    <div class="stat-val {% if h.stations|length > 0 %}text-green{% else %}text-muted{% endif %}">
+      {{ h.stations|length }}/17
+    </div>
+    <div class="stat-lbl">METAR stations</div>
+  </div>
+</div>
+
+<div class="health-grid">
+
+  {# COLLECTION STATUS #}
+  <div class="card">
+    <div class="card-header">Collection Status (last 24h)</div>
+    {% if h.fetch_log %}
+    <table>
+      <thead><tr>
+        <th>Source</th><th>Last fetch</th><th>Records</th><th>Failures</th><th>Status</th>
+      </tr></thead>
+      <tbody>
+      {% for r in h.fetch_log %}
+      <tr>
+        <td class="mono">{{ r.source }}</td>
+        <td class="text-muted" style="font-size:12px">
+          {{ r.last_ts[11:16] if r.last_ts else '—' }} UTC
+        </td>
+        <td>{{ r.records_today or 0 }}</td>
+        <td class="{% if r.failures %}text-red{% else %}text-muted{% endif %}">
+          {{ r.failures or 0 }}
+        </td>
+        <td>
+          {% if r.failures and r.failures > 2 %}
+            <span class="badge badge-red">Degraded</span>
+          {% elif r.records_today %}
+            <span class="badge badge-green">✓ OK</span>
+          {% else %}
+            <span class="badge badge-muted">No data</span>
+          {% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <div style="padding:16px;color:var(--muted)">No fetch log entries yet — collection starting up</div>
+    {% endif %}
+  </div>
+
+  {# STATION COVERAGE #}
+  <div class="card">
+    <div class="card-header">METAR Station Coverage</div>
+    <div style="padding:12px">
+      {% if h.stations %}
+      <div class="station-grid">
+      {% for s in h.stations %}
+        <div class="station-item">
+          <div style="display:flex;justify-content:space-between;align-items:center">
+            <span class="station-name">{{ s.station }}</span>
+            {% if s.last_obs %}
+              <span style="color:var(--green);font-size:14px">●</span>
+            {% else %}
+              <span style="color:var(--muted);font-size:14px">○</span>
+            {% endif %}
+          </div>
+          <div style="font-size:11px;color:var(--muted);margin-top:2px">{{ s.city }}</div>
+          {% if s.last_obs %}
+          <div class="station-time">{{ s.last_obs[11:16] }} UTC
+            {% if s.last_temp %} · {{ '%.1f'|format(s.last_temp) }}°C{% endif %}
+          </div>
+          {% else %}
+          <div class="station-time">No data yet</div>
+          {% endif %}
+        </div>
+      {% endfor %}
+      </div>
+      {% else %}
+      <div style="color:var(--muted)">METAR not yet collected — fetch_weather.py collects every 30min</div>
+      {% endif %}
+    </div>
+  </div>
+
+  {# OPEN ALERTS #}
+  <div class="card">
+    <div class="card-header">Open Alerts</div>
+    <div style="padding:12px">
+      {% if h.alerts %}
+      {% for alert in h.alerts %}
+        {% set atype = alert.alert_type %}
+        <div style="padding:10px;border-radius:6px;margin-bottom:8px;
+                     border-left:3px solid {% if 'neg_risk' in atype %}var(--red){% elif 'obs' in atype %}var(--yellow){% else %}var(--muted){% endif %};
+                     background:rgba(255,255,255,.03)">
+          <div style="display:flex;justify-content:space-between;margin-bottom:4px">
+            <span style="font-size:11px;font-weight:700;text-transform:uppercase;
+                          color:{% if 'neg_risk' in atype %}var(--red){% elif 'obs' in atype %}var(--yellow){% else %}var(--muted){% endif %}">
+              {{ atype.replace('_',' ') }}
+            </span>
+            <a href="/city/{{ alert.city }}" style="font-size:12px">{{ alert.city }}</a>
+          </div>
+          <div style="font-size:12px;color:var(--muted)">
+            Since {{ alert.opened_utc[11:16] if alert.opened_utc else '' }} UTC
+          </div>
+        </div>
+      {% endfor %}
+      {% else %}
+      <div style="color:var(--muted);padding:8px">✓ No open alerts</div>
+      {% endif %}
+    </div>
+  </div>
+
+  {# SETTLEMENT INTEGRITY #}
+  <div class="card">
+    <div class="card-header">Settlement Integrity</div>
+    {% if h.integrity %}
+    <table>
+      <thead><tr>
+        <th>City</th><th>Date</th><th class="text-right">YES</th>
+        <th class="text-right">NO</th><th class="text-right">Pending</th><th>Check</th>
+      </tr></thead>
+      <tbody>
+      {% for r in h.integrity %}
+      <tr>
+        <td><a href="/city/{{ r.city }}">{{ r.city }}</a></td>
+        <td class="text-muted" style="font-size:12px">{{ r.settlement_date }}</td>
+        <td class="text-right {% if r.yes_count == 1 %}text-green{% elif r.yes_count > 1 %}text-red{% else %}text-muted{% endif %}">
+          {{ r.yes_count }}
+        </td>
+        <td class="text-right text-muted">{{ r.no_count }}</td>
+        <td class="text-right text-muted">{{ r.pending }}</td>
+        <td>
+          {% if r.yes_count == 1 %}
+            <span class="badge badge-green">✓ OK</span>
+          {% elif r.yes_count == 0 %}
+            <span class="badge badge-muted">Pending</span>
+          {% else %}
+            <span class="badge badge-red">⚠ {{ r.yes_count }} YES</span>
+          {% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <div style="padding:16px;color:var(--muted)">No settled markets yet</div>
+    {% endif %}
+  </div>
+
+</div>
+{% endblock %}

@@ -1,0 +1,442 @@
+{% extends "base.html" %}
+{% block title %}{{ d.city }} · Polymarket Weather{% endblock %}
+
+{% block extra_head %}
+<style>
+.city-hero { display:flex; align-items:center; justify-content:space-between;
+              margin-bottom:20px; flex-wrap:wrap; gap:12px; }
+.city-hero h1 { font-size:22px; font-weight:700; }
+.city-hero .meta { color:var(--muted); font-size:13px; margin-top:2px; }
+.city-hero .htc-badge { font-size:13px; padding:6px 14px; border-radius:6px;
+                          font-weight:600; }
+.htc-open    { background:#052e16; color:var(--green); }
+.htc-alert   { background:#431407; color:var(--yellow); }
+.htc-closed  { background:#1e3a5f; color:var(--blue); }
+.htc-settled { background:#052e16; color:var(--green); }
+
+/* SETTLED BANNER */
+.settled-banner { background:#052e16; border:1px solid var(--green);
+                   border-radius:10px; padding:16px 20px; margin-bottom:20px;
+                   display:flex; align-items:center; justify-content:space-between; }
+.settled-banner .left { display:flex; flex-direction:column; gap:4px; }
+.settled-banner .big  { font-size:22px; font-weight:700; color:var(--green); }
+.settled-banner .sub  { font-size:12px; color:var(--muted); }
+
+/* MAIN GRID */
+.detail-grid { display:grid; grid-template-columns:320px 1fr; gap:16px; }
+@media(max-width:900px) { .detail-grid { grid-template-columns:1fr; } }
+
+/* BUCKET LADDER */
+.bucket-ladder { display:flex; flex-direction:column; gap:4px; }
+.bucket-row { display:flex; align-items:center; gap:8px; padding:6px 8px;
+               border-radius:6px; transition:background .15s; }
+.bucket-row:hover { background:rgba(255,255,255,.04); }
+.bucket-row.top-bucket { background:rgba(34,197,94,.08); border:1px solid rgba(34,197,94,.2); }
+.bucket-row.settled-yes { background:rgba(34,197,94,.15); border:1px solid var(--green); }
+.bucket-row.impossible { opacity:.35; }
+
+.bkt-label { width:72px; font-size:12px; font-weight:600; font-family:monospace;
+              flex-shrink:0; }
+.bkt-bar-wrap { flex:1; position:relative; height:18px; }
+.bkt-bar-bg { position:absolute; inset:0; background:var(--bg); border-radius:3px; }
+.bkt-bar    { position:absolute; left:0; top:0; bottom:0; border-radius:3px;
+               transition:width .4s; }
+.bkt-fcst-marker { position:absolute; top:0; bottom:0; width:2px;
+                    background:var(--blue); border-radius:2px;
+                    transform:translateX(-50%); opacity:.8; }
+.bkt-price  { width:42px; text-align:right; font-size:12px; font-family:monospace;
+               font-weight:600; flex-shrink:0; }
+.bkt-spread { width:36px; text-align:right; font-size:11px; color:var(--muted);
+               flex-shrink:0; }
+.bar-price-label { position:absolute; right:4px; top:50%; transform:translateY(-50%);
+                    font-size:10px; color:rgba(255,255,255,.5); pointer-events:none; }
+
+/* FORECAST TABLE */
+.fcst-table { width:100%; }
+.fcst-table td, .fcst-table th { padding:7px 10px; font-size:12px; }
+.fcst-table th { font-size:11px; }
+.model-dot { display:inline-block; width:8px; height:8px;
+              border-radius:50%; margin-right:6px; }
+
+/* CHART AREAS */
+.chart-wrap { position:relative; height:200px; }
+.chart-wrap-tall { position:relative; height:240px; }
+
+/* ALERTS */
+.alert-item { padding:10px 12px; border-radius:6px; margin-bottom:8px;
+               border-left:3px solid; }
+.alert-neg-risk { border-color:var(--red); background:rgba(239,68,68,.07); }
+.alert-obs      { border-color:var(--yellow); background:rgba(245,158,11,.07); }
+.alert-other    { border-color:var(--muted); background:rgba(148,163,184,.07); }
+.alert-type     { font-size:11px; font-weight:700; text-transform:uppercase;
+                   letter-spacing:.04em; margin-bottom:3px; }
+.alert-detail   { font-size:12px; color:var(--muted); }
+
+/* SECTION HEADER */
+.section-h { font-size:11px; font-weight:700; text-transform:uppercase;
+               letter-spacing:.06em; color:var(--muted); margin-bottom:10px; }
+
+/* DATA PILLS */
+.data-row { display:flex; gap:10px; flex-wrap:wrap; margin-bottom:16px; }
+.data-pill { background:var(--surface); border:1px solid var(--border);
+              border-radius:8px; padding:10px 14px; flex:1; min-width:100px; }
+.data-pill .label { font-size:10px; text-transform:uppercase; letter-spacing:.05em;
+                     color:var(--muted); }
+.data-pill .value { font-size:18px; font-weight:700; margin-top:3px; font-family:monospace; }
+</style>
+{% endblock %}
+
+{% block content %}
+{% set d = d %}
+
+{# ── HERO ── #}
+<div style="margin-bottom:16px">
+  <a href="/" style="color:var(--muted);font-size:13px">← Overview</a>
+</div>
+<div class="city-hero">
+  <div>
+    <h1>
+      {% if d.status == 'settled' %}✅{% elif d.status == 'alert' %}🟡{% elif d.status == 'post_close' %}🔵{% else %}🟢{% endif %}
+      {{ d.city }}
+      <span style="color:var(--muted);font-weight:400;font-size:16px"> · {{ d.settlement_date }}</span>
+    </h1>
+    <div class="meta">{{ d.station }} · {{ d.timezone }} · Type {{ d.market_type }} market · {{ d.bucket_unit }} buckets</div>
+  </div>
+  <div class="htc-badge {% if d.status == 'settled' %}htc-settled{% elif d.status == 'alert' %}htc-alert{% elif d.status == 'post_close' %}htc-closed{% else %}htc-open{% endif %}">
+    {% if d.hours_to_close is none %}Close time unknown
+    {% elif d.hours_to_close < 0 %}Closed {{ '%.1f'|format(-d.hours_to_close) }}h ago
+    {% elif d.hours_to_close < 1 %}⚠ Closes in {{ (d.hours_to_close * 60)|int }}min
+    {% else %}Closes in {{ '%.1f'|format(d.hours_to_close) }}h{% endif %}
+  </div>
+</div>
+
+{# ── SETTLED BANNER ── #}
+{% if d.status == 'settled' %}
+{% set sb = d.buckets | selectattr('proxy_outcome','eq','YES') | list %}
+{% if sb %}{% set sb = sb[0] %}
+<div class="settled-banner">
+  <div class="left">
+    <div class="big">✅ Settled:
+      {% if sb.bucket_type == 'exact' %}{{ sb.lower_temp|int }}{{ d.bucket_unit }}
+      {% elif sb.bucket_type == 'range' %}{{ sb.lower_temp|int }}–{{ sb.upper_temp|int }}{{ d.bucket_unit }}
+      {% elif sb.bucket_type == 'above_eq' %}≥{{ sb.lower_temp|int }}{{ d.bucket_unit }}
+      {% else %}≤{{ sb.upper_temp|int }}{{ d.bucket_unit }}{% endif %}
+    </div>
+    <div class="sub">proxy_only · confirmed from settlement source</div>
+  </div>
+  {% if d.settle_obs %}
+  <div style="text-align:right">
+    <div style="font-size:18px;font-weight:700;color:var(--green)">{{ '%.1f'|format(d.settle_obs.value) }}{{ d.settle_obs.unit }}</div>
+    <div style="font-size:11px;color:var(--muted)">{{ d.settle_obs.source_name }}</div>
+  </div>
+  {% endif %}
+</div>
+{% endif %}
+{% endif %}
+
+{# ── DATA PILLS ── #}
+<div class="data-row">
+  <div class="data-pill">
+    <div class="label">METAR daily high</div>
+    <div class="value {% if d.metar_high %}text-green{% else %}text-muted{% endif %}">
+      {% if d.metar_high %}{{ '%.1f'|format(d.metar_high) }}°{% else %}—{% endif %}
+    </div>
+  </div>
+  {% if d.forecasts %}
+  {% set f_vals = d.forecasts.values() | selectattr('high_c') | list %}
+  {% if f_vals %}
+  <div class="data-pill">
+    <div class="label">Forecast avg ({{ f_vals|length }} models)</div>
+    <div class="value text-blue">{{ '%.1f'|format(f_vals|map(attribute='high_c')|sum / f_vals|length) }}°</div>
+  </div>
+  <div class="data-pill">
+    <div class="label">Forecast spread</div>
+    {% set highs = f_vals|map(attribute='high_c')|list %}
+    {% set spread = highs|max - highs|min %}
+    <div class="value {% if spread > 3 %}text-red{% elif spread > 1.5 %}text-yellow{% else %}text-green{% endif %}">{{ '%.1f'|format(spread) }}°</div>
+  </div>
+  {% endif %}
+  {% endif %}
+  <div class="data-pill">
+    <div class="label">Open alerts</div>
+    <div class="value {% if d.alerts %}text-yellow{% else %}text-muted{% endif %}">
+      {{ d.alerts|length }}
+    </div>
+  </div>
+</div>
+
+{# ── MAIN DETAIL GRID ── #}
+<div class="detail-grid">
+
+  {# LEFT — BUCKET LADDER #}
+  <div class="card">
+    <div class="card-header">Bucket Ladder — YES prices</div>
+    <div style="padding:12px">
+
+      {# Legend #}
+      <div style="display:flex;gap:16px;margin-bottom:12px;font-size:11px;color:var(--muted)">
+        <span style="display:flex;align-items:center;gap:5px">
+          <span style="display:inline-block;width:8px;height:8px;background:var(--green);border-radius:2px"></span> YES price
+        </span>
+        <span style="display:flex;align-items:center;gap:5px">
+          <span style="display:inline-block;width:2px;height:12px;background:var(--blue);border-radius:1px"></span> Forecast
+        </span>
+      </div>
+
+      {# Compute forecast midpoint for marker #}
+      {% set f_vals = d.forecasts.values() | selectattr('high_c') | list %}
+      {% set fcst_mid = (f_vals|map(attribute='high_c')|sum / f_vals|length) if f_vals else none %}
+
+      {# Max price for bar scaling #}
+      {% set prices = d.buckets | selectattr('yes_mid') | map(attribute='yes_mid') | list %}
+      {% set max_price = prices|max if prices else 1.0 %}
+
+      <div class="bucket-ladder">
+      {% for b in d.buckets %}
+        {% set is_top = b.yes_mid and b.yes_mid == max_price %}
+        {% set is_settled = b.proxy_outcome == 'YES' %}
+        {% set lbl = bucket_label(b) %}
+        {% set pct = ((b.yes_mid or 0) / max_price * 100)|int if max_price > 0 else 0 %}
+
+        {# Determine if forecast falls in this bucket #}
+        {% set has_fcst = false %}
+        {% set fcst_pct = 0 %}
+        {% if fcst_mid %}
+          {% if b.bucket_type == 'exact' and b.lower_temp and fcst_mid|round(0,'floor') == b.lower_temp %}
+            {% set has_fcst = true %}
+          {% elif b.bucket_type == 'range' and b.lower_temp and b.upper_temp and fcst_mid >= b.lower_temp and fcst_mid <= b.upper_temp %}
+            {% set has_fcst = true %}
+          {% elif b.bucket_type == 'above_eq' and b.lower_temp and fcst_mid >= b.lower_temp %}
+            {% set has_fcst = true %}
+          {% elif b.bucket_type == 'below_eq' and b.upper_temp and fcst_mid <= b.upper_temp %}
+            {% set has_fcst = true %}
+          {% endif %}
+        {% endif %}
+
+        <div class="bucket-row {% if is_settled %}settled-yes{% elif is_top %}top-bucket{% endif %}">
+          <span class="bkt-label">{{ lbl }}</span>
+          <div class="bkt-bar-wrap">
+            <div class="bkt-bar-bg"></div>
+            {% if b.yes_mid %}
+              {% if is_settled %}
+                <div class="bkt-bar" style="width:{{ pct }}%;background:var(--green)"></div>
+              {% elif is_top %}
+                <div class="bkt-bar" style="width:{{ pct }}%;background:linear-gradient(90deg,#22c55e88,#22c55e)"></div>
+              {% else %}
+                <div class="bkt-bar" style="width:{{ pct }}%;background:linear-gradient(90deg,#334155,#475569)"></div>
+              {% endif %}
+            {% endif %}
+            {% if has_fcst %}
+              <div class="bkt-fcst-marker" style="left:{{ [pct+5,95]|min }}%"></div>
+            {% endif %}
+          </div>
+          <span class="bkt-price {% if is_settled %}text-green{% elif is_top %}text-green{% else %}text-muted{% endif %}">
+            {% if b.yes_mid %}{{ '%.2f'|format(b.yes_mid) }}{% else %}—{% endif %}
+          </span>
+          <span class="bkt-spread">
+            {% if b.spread %}{{ '%.2f'|format(b.spread) }}{% endif %}
+          </span>
+        </div>
+      {% endfor %}
+      </div>
+
+      {% if fcst_mid %}
+      <div style="margin-top:12px;padding:8px;background:rgba(59,130,246,.1);border-radius:6px;
+                   font-size:12px;display:flex;justify-content:space-between">
+        <span style="color:var(--muted)">▶ Forecast median</span>
+        <span style="color:var(--blue);font-weight:600">{{ '%.1f'|format(fcst_mid) }}{{ d.bucket_unit }}</span>
+      </div>
+      {% endif %}
+    </div>
+  </div>
+
+  {# RIGHT COLUMN #}
+  <div style="display:flex;flex-direction:column;gap:16px">
+
+    {# FORECAST TABLE #}
+    <div class="card">
+      <div class="card-header">Model Forecasts</div>
+      <div style="padding:12px">
+        {% if d.forecasts %}
+        {% set model_colors = {'ecmwf_ifs025':'#22c55e','gfs_seamless':'#3b82f6','icon_seamless':'#f59e0b','gem_seamless':'#a78bfa','meteofrance_seamless':'#14b8a6'} %}
+        <table class="fcst-table">
+          <thead><tr>
+            <th>Model</th>
+            <th class="text-right">High</th>
+            <th class="text-right">Low</th>
+            <th class="text-right">Fetched</th>
+          </tr></thead>
+          <tbody>
+          {% for model, f in d.forecasts.items() %}
+          <tr>
+            <td>
+              <span class="model-dot" style="background:{{ model_colors.get(model,'#64748b') }}"></span>
+              {{ model.replace('_seamless','').replace('_ifs025',' IFS').upper() }}
+            </td>
+            <td class="text-right bold">{% if f.high_c %}{{ '%.1f'|format(f.high_c) }}°{% else %}—{% endif %}</td>
+            <td class="text-right text-muted">{% if f.low_c %}{{ '%.1f'|format(f.low_c) }}°{% else %}—{% endif %}</td>
+            <td class="text-right text-muted" style="font-size:11px">
+              {% if f.fetched_utc %}{{ f.fetched_utc[11:16] }} UTC{% endif %}
+            </td>
+          </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+        {% else %}
+        <div style="color:var(--muted);font-size:13px;padding:8px">No forecast data yet — fetch_weather.py collecting</div>
+        {% endif %}
+      </div>
+    </div>
+
+    {# PRICE TIMELINE CHART #}
+    <div class="card">
+      <div class="card-header">Price Timeline — top buckets</div>
+      <div style="padding:12px">
+        {% if d.price_history %}
+        <div class="chart-wrap-tall">
+          <canvas id="priceChart"></canvas>
+        </div>
+        {% else %}
+        <div style="color:var(--muted);font-size:13px;padding:8px">
+          Collecting price history — check back after a few snapshots
+        </div>
+        {% endif %}
+      </div>
+    </div>
+
+    {# INTRADAY TEMP #}
+    <div class="card">
+      <div class="card-header">Intraday Temperature · {{ d.station }}</div>
+      <div style="padding:12px">
+        {% if d.metar_path %}
+        <div class="chart-wrap">
+          <canvas id="metarChart"></canvas>
+        </div>
+        {% else %}
+        <div style="color:var(--muted);font-size:13px;padding:8px">
+          METAR observations collecting — check back in ~30 minutes
+        </div>
+        {% endif %}
+      </div>
+    </div>
+
+  </div>
+</div>
+
+{# ALERTS #}
+{% if d.alerts %}
+<div style="margin-top:16px" class="card">
+  <div class="card-header">Open Alerts</div>
+  <div style="padding:12px">
+    {% for alert in d.alerts %}
+    {% set atype = alert.alert_type %}
+    <div class="alert-item {% if 'neg_risk' in atype %}alert-neg-risk{% elif 'obs' in atype %}alert-obs{% else %}alert-other{% endif %}">
+      <div class="alert-type {% if 'neg_risk' in atype %}text-red{% elif 'obs' in atype %}text-yellow{% endif %}">
+        {{ atype.replace('_',' ') }}
+      </div>
+      <div class="alert-detail">
+        {{ alert.opened_utc[0:16] if alert.opened_utc else '' }} UTC ·
+        {% if alert.detail_json %}
+          {% set det = json.loads(alert.detail_json) %}
+          {% for k, v in det.items() %}{{ k }}={{ v }}{% if not loop.last %} · {% endif %}{% endfor %}
+        {% endif %}
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+</div>
+{% endif %}
+
+{% endblock %}
+
+{% block extra_scripts %}
+<script>
+const COLORS = ['#22c55e','#3b82f6','#f59e0b','#a78bfa','#14b8a6','#ef4444'];
+
+// Price timeline chart
+{% if d.price_history %}
+(function(){
+  const hist = {{ json.dumps(d.price_history) }};
+  const labels = new Set();
+  Object.values(hist).forEach(pts => pts.forEach(p => labels.add(p.t)));
+  const sortedLabels = Array.from(labels).sort();
+  const displayLabels = sortedLabels.map(t => t.substring(11,16) + ' UTC');
+
+  const datasets = Object.entries(hist).map(([label, pts], i) => {
+    const map = {};
+    pts.forEach(p => map[p.t] = p.p);
+    return {
+      label,
+      data: sortedLabels.map(t => map[t] ?? null),
+      borderColor: COLORS[i % COLORS.length],
+      backgroundColor: COLORS[i % COLORS.length] + '22',
+      borderWidth: 2,
+      pointRadius: 2,
+      tension: 0.3,
+      spanGaps: true,
+    };
+  });
+
+  new Chart(document.getElementById('priceChart'), {
+    type: 'line',
+    data: { labels: displayLabels, datasets },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      scales: {
+        x: { ticks: { color:'#64748b', maxTicksLimit:8, font:{size:10} }, grid:{color:'#1e293b'} },
+        y: { min:0, max:1, ticks:{ color:'#64748b', font:{size:10},
+              callback: v => (v*100).toFixed(0)+'¢' }, grid:{color:'#1e293b'} }
+      },
+      plugins: { legend:{ labels:{ color:'#94a3b8', font:{size:11}, boxWidth:12 } } }
+    }
+  });
+})();
+{% endif %}
+
+// METAR intraday chart
+{% if d.metar_path %}
+(function(){
+  const path = {{ json.dumps(d.metar_path) }};
+  const labels = path.map(p => p.local_hour + ':00');
+  const temps  = path.map(p => p.max_temp);
+  {% set f_vals = d.forecasts.values() | selectattr('high_c') | list %}
+  {% if f_vals %}
+  const fcstLine = path.map(() => {{ (f_vals|map(attribute='high_c')|sum / f_vals|length)|round(1) }});
+  {% endif %}
+
+  const datasets = [{
+    label: 'Daily high (METAR)',
+    data: temps,
+    borderColor: '#22c55e',
+    backgroundColor: '#22c55e22',
+    borderWidth: 2,
+    pointRadius: 3,
+    fill: true,
+    tension: 0.3,
+  }{% if f_vals %},{
+    label: 'Forecast median',
+    data: fcstLine,
+    borderColor: '#3b82f6',
+    borderDash: [5,3],
+    borderWidth: 1.5,
+    pointRadius: 0,
+    fill: false,
+  }{% endif %}];
+
+  new Chart(document.getElementById('metarChart'), {
+    type: 'line',
+    data: { labels, datasets },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      scales: {
+        x: { ticks:{ color:'#64748b', font:{size:10} }, grid:{color:'#1e293b'} },
+        y: { ticks:{ color:'#64748b', font:{size:10},
+              callback: v => v.toFixed(1)+'°' }, grid:{color:'#1e293b'} }
+      },
+      plugins: { legend:{ labels:{ color:'#94a3b8', font:{size:11}, boxWidth:12 } } }
+    }
+  });
+})();
+{% endif %}
+</script>
+{% endblock %}

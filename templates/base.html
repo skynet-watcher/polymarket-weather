@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{% block title %}Polymarket Weather{% endblock %}</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<style>
+:root {
+  --bg:       #0f172a;
+  --surface:  #1e293b;
+  --border:   #334155;
+  --text:     #f1f5f9;
+  --muted:    #94a3b8;
+  --green:    #22c55e;
+  --yellow:   #f59e0b;
+  --blue:     #3b82f6;
+  --red:      #ef4444;
+  --purple:   #a78bfa;
+  --teal:     #14b8a6;
+}
+* { box-sizing:border-box; margin:0; padding:0; }
+body { background:var(--bg); color:var(--text); font-family:'Inter',system-ui,sans-serif;
+       font-size:14px; line-height:1.5; }
+a { color:var(--blue); text-decoration:none; }
+a:hover { text-decoration:underline; }
+
+/* NAV */
+nav { background:var(--surface); border-bottom:1px solid var(--border);
+      padding:0 24px; display:flex; align-items:center; gap:24px; height:52px; }
+nav .logo { font-weight:700; font-size:16px; color:var(--text);
+             display:flex; align-items:center; gap:8px; }
+nav .logo span { color:var(--yellow); }
+nav .nav-links { display:flex; gap:4px; }
+nav .nav-links a { padding:6px 14px; border-radius:6px; color:var(--muted);
+                    font-size:13px; font-weight:500; transition:all .15s; }
+nav .nav-links a:hover, nav .nav-links a.active { background:var(--border);
+  color:var(--text); text-decoration:none; }
+nav .status { margin-left:auto; font-size:12px; color:var(--muted);
+               display:flex; align-items:center; gap:8px; }
+nav .dot { width:8px; height:8px; border-radius:50%; background:var(--green);
+            animation:pulse 2s infinite; }
+@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
+
+/* LAYOUT */
+.container { max-width:1400px; margin:0 auto; padding:24px; }
+.page-header { margin-bottom:24px; }
+.page-header h1 { font-size:20px; font-weight:600; }
+.page-header p { color:var(--muted); font-size:13px; margin-top:4px; }
+
+/* CARDS */
+.card { background:var(--surface); border:1px solid var(--border);
+        border-radius:10px; overflow:hidden; }
+.card-header { padding:14px 16px; border-bottom:1px solid var(--border);
+                font-weight:600; font-size:13px; color:var(--muted);
+                text-transform:uppercase; letter-spacing:.05em; }
+
+/* BADGES */
+.badge { display:inline-flex; align-items:center; gap:4px; padding:2px 8px;
+          border-radius:4px; font-size:11px; font-weight:600; text-transform:uppercase; }
+.badge-green  { background:#052e16; color:var(--green); }
+.badge-yellow { background:#431407; color:var(--yellow); }
+.badge-blue   { background:#1e3a5f; color:var(--blue); }
+.badge-red    { background:#3f0b0b; color:var(--red); }
+.badge-muted  { background:var(--border); color:var(--muted); }
+
+/* TABLE */
+table { width:100%; border-collapse:collapse; }
+th { text-align:left; padding:8px 12px; font-size:11px; font-weight:600;
+     text-transform:uppercase; letter-spacing:.05em; color:var(--muted);
+     border-bottom:1px solid var(--border); }
+td { padding:9px 12px; border-bottom:1px solid #1e293b; font-size:13px; }
+tr:last-child td { border-bottom:none; }
+tr:hover td { background:rgba(255,255,255,.02); }
+
+/* UTILS */
+.text-green  { color:var(--green); }
+.text-yellow { color:var(--yellow); }
+.text-blue   { color:var(--blue); }
+.text-red    { color:var(--red); }
+.text-muted  { color:var(--muted); }
+.text-right  { text-align:right; }
+.mono        { font-family:'JetBrains Mono',monospace; }
+.bold        { font-weight:600; }
+
+/* GRID */
+.grid-4 { display:grid; grid-template-columns:repeat(4,1fr); gap:16px; }
+.grid-3 { display:grid; grid-template-columns:repeat(3,1fr); gap:16px; }
+.grid-2 { display:grid; grid-template-columns:repeat(2,1fr); gap:16px; }
+@media(max-width:1100px) { .grid-4 { grid-template-columns:repeat(3,1fr); } }
+@media(max-width:800px)  { .grid-4 { grid-template-columns:repeat(2,1fr); }
+                            .grid-3 { grid-template-columns:1fr; } }
+</style>
+{% block extra_head %}{% endblock %}
+</head>
+<body>
+<nav>
+  <div class="logo">🌡️ <span>Polymarket</span> Weather</div>
+  <div class="nav-links">
+    <a href="/" class="{% if request.url.path == '/' %}active{% endif %}">Overview</a>
+    <a href="/health" class="{% if request.url.path == '/health' %}active{% endif %}">Health</a>
+  </div>
+  <div class="status">
+    <span class="dot"></span>
+    Live · {{ generated_at if generated_at is defined else '' }}
+  </div>
+</nav>
+<div class="container">
+{% block content %}{% endblock %}
+</div>
+<script>
+// Auto-refresh every 60s
+setTimeout(() => location.reload(), 60000);
+</script>
+{% block extra_scripts %}{% endblock %}
+</body>
+</html>
