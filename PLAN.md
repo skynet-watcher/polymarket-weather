@@ -890,7 +890,7 @@ and analysis scripts should fail loudly when required data is absent.
 | city_stations.json | ✅ Enriched | `timezone`, `lat`, `lon`, units, proxy station, and source metadata present for all 17 cities |
 | wx_observations schema | ✅ Migrated | `observed_utc`, `fetched_utc`, `local_date`, `local_hour`, raw payload, and local-day highs stored |
 | Polymarket close_time_utc | ✅ Confirmed | 12:00 UTC universal — scraped from settled markets |
-| rules/source adapters | ❌ Missing | WU/HKO/NOAA/final outcome adapters not built |
+| rules/source adapters | ⚠️ Partial | HKO CSV and NOAA WRH/Synoptic adapters added; WU and Polymarket/UMA final still pending |
 | unit/range parser | ✅ Built | Exact C buckets, Fahrenheit range buckets, and floor/ceiling buckets parsed |
 | orderbook depth | ✅ Built | Best prices, best sizes, spread, raw YES/NO books, and timing labels stored |
 
@@ -1017,7 +1017,8 @@ This will fail silently when fetches happen near UTC midnight for UTC+ stations.
       `settlement_rounding_rule`, units, bucket ranges, and raw market JSON
 - [x] `log_orderbooks.py`: compute `hours_to_close`, assign nullable `snapshot_label`,
       store sizes/depth/spread/raw book JSON
-- [ ] Add `fetch_settlement_sources.py`: WU, Hong Kong Observatory, NOAA WRH adapters
+- [ ] Add `fetch_settlement_sources.py`: HKO and NOAA WRH adapters are built; WU and
+      Polymarket/UMA final adapters still pending
 - [ ] `settle_markets.py`: write proxy and final settlement, apply unit conversion,
       precision, bucket-aware logic, and final Polymarket/UMA reconciliation
 - [ ] Full scheduled loop running continuously
