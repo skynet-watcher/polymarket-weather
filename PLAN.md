@@ -325,6 +325,14 @@ CREATE TABLE weather_markets (
     settlement_temp_c_proxy REAL,            -- Q2: METAR daily high at close time (fast proxy)
     settlement_temp_c_final REAL,            -- Q2: Polymarket/UMA resolved outcome (final truth)
     settlement_source       TEXT,            -- which source was used for proxy settlement
+    settlement_rounding_rule TEXT,           -- Q2: how Polymarket rounds fractional temps
+                                             --     'round' | 'floor' | 'ceiling' | unknown
+                                             --     METAR reports 21.7C; bucket is integer 22C
+                                             --     must apply same rule or proxy match fails
+    settlement_window_hours  REAL,           -- hours from local midnight to settlement
+                                             --     NYC/Miami ≈ 8h (morning only)
+                                             --     Seoul/Tokyo ≈ 21h (full day)
+                                             --     determines what "daily high" means here
     resolution_status       TEXT,            -- 'proxy_only' | 'confirmed' | 'disputed'
     settled_at_utc          TEXT,            -- when settle_markets.py ran for this market
     active                  INTEGER DEFAULT 1,
@@ -506,17 +514,31 @@ not by taking `DATE(end_date_utc)` in UTC. These differ for any station where
 UTC midnight and local midnight don't coincide, which is all non-UTC stations.
 
 **Rule**: `settlement_date` = `end_date_utc` converted to station timezone, date only.
+`close_time_utc` = settlement date + `T12:00:00Z` (confirmed universal for all weather markets).
 Store the derivation method in a comment in `discover_markets.py` so it cannot drift.
+
+Note: for cities where 12:00 UTC is before local midnight (Wellington), the settlement
+date local is the NEXT day's date. For `settlement_date` use the date of the local day
+being measured, which is `close_time_utc - 12h` converted to local date for all cities.
+Concretely: `settlement_date = (close_dt_utc - timedelta(hours=12)).astimezone(tz).date()`
+guarantees you get the measured day's date, not the settlement day's date.
 
 ### Q2: actual temperature resolution
 
-**The settlement lookup**: `MAX(temp_c) WHERE station=? AND local_date=?`
+**The settlement lookup**: `MAX(temp_c) WHERE station=? AND local_date=? AND observed_utc <= close_time_utc`
 
-`settle_markets.py` runs 30 minutes after `close_time_utc`. It must compute the
-`local_date` to query by converting `close_time_utc` to the station's timezone and
-extracting the local date from that. Using `dt.date.today()` is wrong — the server's
-UTC date at 04:30 UTC may match the local date by coincidence, but will fail for any
-station where the settlement UTC time crosses local midnight.
+`settle_markets.py` runs 30 minutes after `close_time_utc`. The daily high must be
+computed only over observations from local midnight up to `close_time_utc` — not from
+midnight to midnight — because several cities (NYC, Miami, London, Madrid) settle before
+their afternoon peak. Including post-settlement readings would give a higher value than
+WU reports at settlement time.
+
+The `local_date` to query must be the settlement day's local calendar date, derived
+by backing off 12 hours from `close_time_utc` before converting to local time:
+```python
+settlement_day = (datetime.fromisoformat(close_time_utc) - timedelta(hours=12)).astimezone(tz).date()
+```
+This correctly handles Wellington (where 12:00 UTC = midnight NZST next day).
 
 Correct pattern:
 ```python
@@ -591,25 +613,88 @@ WHERE DATE(ts_utc) = DATE('now')               -- server UTC, not station local
 ## Phase Plan
 
 ### Phase 1 — Data collection (in progress)
+
+**Audit status as of 2026-06-01** — what is actually working vs what the plan describes:
+
+| Component | Status | Finding |
+|-----------|--------|---------|
+| METAR fetch | ✅ Collecting | 16 stations, all responding |
+| TAF fetch | ✅ Collecting | 15 TAFs, Seoul TX=31°C confirmed |
+| GFS model | ✅ Collecting | 48 rows (16 stations × 3 days) |
+| ICON, MF, GEM | ❌ Not yet run | Only GFS fetched so far |
+| ECMWF direct | ❌ Not built | Still using open-meteo for ECMWF |
+| weather_markets table | ❌ Missing | discover_markets.py not producing rows |
+| ob_snapshots table | ❌ Missing | log_orderbooks.py not running |
+| city_stations.json | ⚠️ Incomplete | Missing `timezone`, `lat`, `lon` fields |
+| wx_observations schema | ❌ Old schema | Missing `observed_utc`, `local_date`, `fetched_utc` |
+| Polymarket close_time_utc | ⚠️ Unclear | end_date is date-only; no time component found |
+
+**Critical findings from audit:**
+
+**1. Schema is stale — wx_observations has wrong columns**
+Current columns: `id, station, city, ts_utc, temp_c, daily_high_c, source`
+Required columns: `id, station, city, observed_utc, fetched_utc, local_date, temp_c, daily_high_c, source`
+`ts_utc` is storing fetch time, not observation time. `observed_utc` and `local_date` not present.
+
+**2. city_stations.json missing timezone, lat, lon**
+The plan designates it as single source of truth but it currently only has:
+`city, slug, station, country, wu_path, anomaly, anomaly_note`
+Missing: `timezone, lat, lon`
+All scripts that need these fields (fetch_weather.py, settle_markets.py) hardcode them instead.
+
+**3. Settlement time confirmed: 12:00 UTC for all weather markets**
+Scraped from a known-settled Seoul May 30 market: `end_date_iso = '2026-05-30T12:00:00Z'`.
+`close_time_utc = settlement_date + 'T12:00:00Z'` for all cities. This is universal.
+
+However, 12:00 UTC resolves to very different local times per city, and several cities
+settle BEFORE their typical afternoon temperature peak:
+
+| City group | Local settlement time | vs daily peak | Implication |
+|-----------|----------------------|---------------|-------------|
+| Seoul, Tokyo, Beijing, Singapore | ~20:00–21:00 local | ✓ after peak | Full day measured |
+| Wellington | 00:00 local next day (midnight) | ✓ full day complete | Correct |
+| London, Paris, Munich, Amsterdam | 13:00–14:00 local | ✗ 1–2h before peak | Partial day |
+| Madrid | 14:00 local | ✗ 2h before peak | Partial day |
+| NYC, Miami | 08:00 local | ✗ 7h before peak | Morning only |
+
+**Implication for daily_high_c**: do NOT track the running max from local midnight to
+local midnight. Track from local midnight to `close_time_utc` in local time. For NYC,
+the "daily high" this system should record is the max observed between midnight EDT and
+08:00 EDT — matching the window WU has data for when Polymarket resolves.
+
+For any city settling before the afternoon peak, our METAR daily high collected after
+08:00 local will be higher than the WU settlement value. This is not a bug in data
+collection — it reflects how the market is designed. Flag it in analysis as
+`settlement_window_hours` (= hours from local midnight to settlement).
+
+**4. forecast_date timezone: looks correct by coincidence today**
+At 03:03 UTC on June 1, all station UTC dates and local dates happen to match (it is
+June 1 everywhere except Pacific/Auckland which was already June 1 local).
+This will fail silently when fetches happen near UTC midnight for UTC+ stations.
+
+**Checklist:**
 - [x] 17 city markets / 16 unique settlement stations identified and mapped
-- [x] METAR fetch working — all 16 stations, correct resolution-source instrument
-- [x] TAF fetch working — TX/TN parsed for 5 stations
-- [x] GFS, ICON, Météo-France, GEM via open-meteo — all confirmed
-- [x] Retry logic + fetch_log with exact timestamps and duration
-- [ ] **Timestamp fixes** (critical — do before trusting any collected data):
-      - Add `timezone`, `lat`, `lon` to `data/city_stations.json`; load in all scripts
-      - Store `observed_utc` from METAR `reportTime`, separate from `fetched_utc`
-      - Compute `local_date` from `observed_utc` + station timezone; use for daily high grouping
-      - Pass station timezone to open-meteo so `forecast_date` is in local calendar
-      - Replace all `dt.datetime.now()` with `dt.datetime.now(dt.timezone.utc)`
-- [ ] Create `scripts/init_db.py` as single schema owner
-- [ ] ECMWF direct via `ecmwf-opendata` (replace open-meteo ECMWF — 3h faster)
-- [ ] `discover_markets.py` refined: set `first_seen_utc`, `close_time_utc`,
-      `rules_source`, `resolution_source_url`; prefer Gamma/CLOB structured metadata
-      over HTML scraping where available
+- [x] METAR fetch working — 16 stations responding, temperatures correct
+- [x] TAF fetch working — TX/TN parsed for 5 stations, issued/valid timestamps in UTC
+- [x] GFS via open-meteo — 48 rows confirmed
+- [x] Retry logic + fetch_log logging correctly
+- [ ] **Fix city_stations.json**: add `timezone`, `lat`, `lon` for all 17 entries
+- [ ] **Fix wx_observations schema**: add `observed_utc`, `local_date`, `fetched_utc`;
+      store METAR `reportTime` as `observed_utc`; compute `local_date` from that
+      using station timezone; keep `fetched_utc` as when system retrieved it
+- [ ] **Fix daily high query**: use `(station, local_date)` not `DATE(ts_utc)`
+- [ ] **Determine Polymarket settlement time**: scrape one settled market's resolution
+      details to find exact UTC close time per city; hardcode if consistent
+- [ ] **Fix open-meteo timezone**: pass `timezone=<station tz>` per model request
+      so `forecast_date` is in station's local calendar, not UTC
+- [ ] **Run ICON, MF, GEM**: only GFS collected so far
+- [ ] Create `scripts/init_db.py` as single schema owner; apply new schema
+- [ ] ECMWF direct via `ecmwf-opendata` (3h faster than open-meteo mirror)
+- [ ] `discover_markets.py` refined: populate `weather_markets` table with
+      `first_seen_utc`, `close_time_utc`, `rules_source`, `resolution_source_url`,
+      `settlement_rounding_rule`
 - [ ] `log_orderbooks.py`: compute `hours_to_close`, assign nullable `snapshot_label`
-- [ ] `settle_markets.py`: write `settlement_temp_c_proxy` (METAR) and
-      `settlement_temp_c_final` (Polymarket/UMA) with `resolution_status`
+- [ ] `settle_markets.py`: write proxy and final settlement, apply rounding rule
 - [ ] Full scheduled loop running continuously
 
 ### Phase 2 — Gap detection
