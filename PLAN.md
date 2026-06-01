@@ -351,7 +351,37 @@ ORDER BY wm.city, wm.lower_temp
 
 ### Q3: Order book prices at open and at standard intervals to close?
 
-**Standard intervals**: T-48h (open), T-24h, T-12h, T-6h, T-3h, T-1h, T-30min, T-close
+**Standard intervals**: `open` (first-seen), `T-24h`, `T-12h`, `T-6h`, `T-3h`, `T-1h`, `T-30min`, `post_close`
+
+**`snapshot_label` semantics — two kinds of labels:**
+
+Every 2-minute snapshot is stored and receives a bin label based on `hours_to_close`. This
+makes time-slice queries simple. In addition, the first snapshot taken within 5 minutes of
+`first_seen_utc` receives the special `open` label, which is set only once per market and
+never overwritten.
+
+Bin label assignment (applied to every snapshot by `hours_to_close`):
+
+| Label | Fires when `hours_to_close` is… |
+|-------|----------------------------------|
+| `T-30min` | ≤ 0.5h |
+| `T-1h` | ≤ 1h |
+| `T-3h` | ≤ 3h |
+| `T-6h` | ≤ 6h |
+| `T-12h` | ≤ 12h |
+| `T-24h` | ≤ 24h |
+| `open_window` | > 24h and no `open` label yet earned |
+| `post_close` | < 0h (after trading close) |
+
+`open` label: fires once — on the first snapshot for that `condition_id` whose `ts_utc` is
+within 5 minutes of `weather_markets.first_seen_utc`. Requires `first_seen_utc` to be loaded
+into the market dict by `_load_active_markets`. If `first_seen_utc` is NULL or no snapshot
+falls in the window, no `open` label is assigned.
+
+Note: T-48h is not a bin label because few markets are discovered exactly 48h before close.
+The `open` label is the honest substitute — it records what we first observed, whenever that
+was. Always display `first_seen_utc` alongside `snapshot_label='open'` in analysis output
+so the actual discovery lag is visible.
 
 **The query**:
 ```sql
@@ -364,14 +394,10 @@ WHERE wm.city = ? AND wm.settlement_date = ?
 ORDER BY ob.ts_utc, wm.lower_temp
 ```
 
-**Important**: `snapshot_label` is nullable. Every 2-minute raw snapshot is stored regardless.
-Labels are assigned when a snapshot falls within 5 minutes of a standard threshold.
-Analysis can select nearest snapshots even if a label window was missed.
-
 **Requires**:
-- `ob_snapshots.snapshot_label` — nullable; assigned at capture time near standard thresholds
+- `ob_snapshots.snapshot_label` — bin label always set; `open` set once per market
 - `ob_snapshots.hours_to_close` — computed at capture time from `close_time_utc`
-- `weather_markets.first_seen_utc` and `close_time_utc` — to compute label offsets
+- `weather_markets.first_seen_utc` and `close_time_utc` — loaded into market dict at capture time
 
 ---
 
@@ -799,8 +825,26 @@ store both raw and normalized values.
 **`hours_to_close` arithmetic**: computed as `(close_time_utc - ts_utc) / 3600`.
 Both are UTC strings. Subtraction is timezone-safe. ✓
 
-**`snapshot_label` assignment**: relative time comparison against `hours_to_close`
-thresholds. No calendar date involved. Timezone-safe. ✓
+**`snapshot_label` assignment**: bin labels use `hours_to_close` comparison only — no
+calendar date involved. Timezone-safe. ✓ The `open` label additionally requires
+`first_seen_utc` to be loaded per market at collection time.
+
+**Known code bug — `_load_active_markets` does not fetch `first_seen_utc`**: the current
+implementation of `log_orderbooks.py` does not include `first_seen_utc` in the market dict,
+so the `open` label can never be assigned. Fix: add `first_seen_utc` to the SELECT in
+`_load_active_markets`, then check it when assigning labels in `_snapshot_market`.
+
+**Known code bug — label thresholds do not match this plan**: as of 2026-06-01, the code
+uses `[0.5, 1, 2, 4, 8, 12, 24]` as thresholds (T-2h, T-4h, T-8h present; T-3h, T-6h
+absent). These must be corrected to `[0.5, 1, 3, 6, 12, 24]` to match the standard intervals
+defined here.
+
+**Known code bug — active market filter drops NYC/Miami near UTC midnight**: `_load_active_markets`
+uses `settlement_date >= date('now')` where `date('now')` is UTC. For Type C cities (NYC,
+Miami), local midnight is 04:00–05:00 UTC next day. After UTC midnight their settlement_date
+(local June 1) is less than `date('now')` (UTC June 2), dropping them from monitoring before
+their temperature window closes. Fix: use `settlement_date >= date('now', '-1 day')` to
+extend the window, and let `close_time_utc` + `hours_to_close` govern post-close labeling.
 
 **Dependency risk**: `close_time_utc` must be populated before `log_orderbooks.py`
 runs for a market. If `discover_markets.py` fails or hasn't run yet, `close_time_utc`
@@ -810,11 +854,10 @@ stored, but the standard interval view is empty for that market.
 Mitigation: `log_orderbooks.py` should log a warning per market where `close_time_utc`
 is NULL, and retry discovery before the next collection cycle.
 
-**"Open" label is first-seen, not true market creation**: the `open` label fires on
-the first snapshot within 5 minutes of `first_seen_utc`. If `discover_markets.py`
+**"Open" label is first-seen, not true market creation**: if `discover_markets.py`
 first runs 36 hours before settlement (instead of 48h), the "open" snapshot is at T-36h,
 not T-48h. The data is honest — it reflects what we first observed — but queries
-that assume "open = T-48h" will be misleading. Always present `first_seen_utc` alongside
+that assume "open = T-48h" will be misleading. Always display `first_seen_utc` alongside
 `snapshot_label = 'open'` in analysis output so the actual discovery lag is visible.
 
 **Executability requirement**: every orderbook snapshot must include size/depth and raw
@@ -853,22 +896,25 @@ WHERE DATE(ts_utc) = DATE('now')               -- server UTC, not station local
 Every planned test must map to fields captured at collection time. If a required field is
 missing, the test is not allowed to produce a strategy conclusion.
 
-| Test | Required captured data |
-|------|------------------------|
-| Resolution source mismatch audit | `weather_markets.rules_text`, `rules_source`, `resolution_source_type`, `settlement_observations.value/unit/raw_payload_json`, `wx_observations.daily_high_c`, `market_resolutions.resolved_outcome/resolved_value` |
-| Liquidity / executability filter | `ob_snapshots.yes_bid/yes_ask/no_bid/no_ask`, all size fields, `spread`, `raw_book_json`, `hours_to_close` |
-| Already priced in | source `observed_utc` or model valid/run time, `fetched_utc`, first `ob_snapshots.ts_utc` after fetch, pre-fetch and post-fetch price deltas |
-| Data delay / source latency | source valid/publish time where available, system `fetched_utc`, first DB insert/change time, first orderbook snapshot after fetch |
-| Forecast revision momentum | `model_forecasts.model`, `model_run_utc`, `model_run_is_estimated`, `fetched_utc`, `forecast_date`, `high_c/low_c`, orderbook snapshots after each revision |
-| Stale observation strategy | `wx_observations.observed_utc/fetched_utc/local_date/daily_high_c`, trading `close_time_utc`, bucket lower/upper/unit, executable orderbook snapshot |
-| Market-open forecast accuracy | `weather_markets.first_seen_utc`, `model_forecasts.fetched_utc <= first_seen_utc`, opening bucket prices, final settlement value |
-| Forecast consensus vs market | all model forecasts for same station/local_date, opening or selected-time market distribution, final settlement value |
-| Best forecast timing by station | forecast `fetched_utc`, `model_run_utc`, `hours_before_close`, station timezone/local date, final settlement value |
-| Dynamic rebalancing | full sequence of forecasts, observations, settlement-source updates, orderbook snapshots, and simulated position events |
-| Negative-risk gaps | `weather_markets.neg_risk_market_id`, bucket lower/upper/unit/type, executable prices/sizes for every bucket in group |
-| Local-time weather path | `wx_observations.local_hour`, `is_in_peak_window`, station timezone, orderbook repricing after local milestones |
-| Station reliability | forecast error, proxy/source mismatch rate, intraday volatility, late-day new highs, liquidity/spread/repricing metrics |
-| Bucket adjacency / hedge quality | bucket intervals, neg-risk group, executable bid/ask/size, settlement outcome, capital-at-risk model |
+Tests marked ⛔ **Blocked** cannot produce conclusions until the listed blocker is resolved.
+Tests marked ⚠️ **Partial** can run but results will be incomplete.
+
+| Test | Required captured data | Status |
+|------|------------------------|--------|
+| Resolution source mismatch audit | `weather_markets.rules_text`, `rules_source`, `resolution_source_type`, `settlement_observations.value/unit/raw_payload_json`, `wx_observations.daily_high_c`, `market_resolutions.resolved_outcome/resolved_value` | ⛔ Blocked — WU adapter missing; ~82% of markets have no `settlement_value_proxy` |
+| Liquidity / executability filter | `ob_snapshots.yes_bid/yes_ask/no_bid/no_ask`, all size fields, `spread`, `raw_book_json`, `hours_to_close` | ✅ Ready |
+| Already priced in | source `observed_utc` or model valid/run time, `fetched_utc`, first `ob_snapshots.ts_utc` after fetch, pre-fetch and post-fetch price deltas | ✅ Ready |
+| Data delay / source latency | source valid/publish time where available, system `fetched_utc`, first DB insert/change time, first orderbook snapshot after fetch | ✅ Ready |
+| Forecast revision momentum | `model_forecasts.model`, `model_run_utc`, `model_run_is_estimated`, `fetched_utc`, `forecast_date`, `high_c/low_c`, orderbook snapshots after each revision | ⚠️ Partial — only GFS + TAF collecting; ICON/MF/GEM absent |
+| Stale observation strategy | `wx_observations.observed_utc/fetched_utc/local_date/daily_high_c`, trading `close_time_utc`, bucket lower/upper/unit, executable orderbook snapshot | ✅ Ready |
+| Market-open forecast accuracy | `weather_markets.first_seen_utc`, `model_forecasts.fetched_utc <= first_seen_utc`, opening bucket prices, final settlement value | ⚠️ Partial — `open` snapshot label not yet firing; only GFS for forecasts |
+| Forecast consensus vs market | all model forecasts for same station/local_date, opening or selected-time market distribution, final settlement value | ⛔ Blocked — requires ≥3 models; currently only GFS + TAF (partial) |
+| Best forecast timing by station | forecast `fetched_utc`, `model_run_utc`, `hours_before_close`, station timezone/local date, final settlement value | ⚠️ Partial — single model limits per-station comparison |
+| Dynamic rebalancing | full sequence of forecasts, observations, settlement-source updates, orderbook snapshots, and simulated position events | ⛔ Blocked — WU adapter missing for most cities |
+| Negative-risk gaps | `weather_markets.neg_risk_market_id`, bucket lower/upper/unit/type, executable prices/sizes for every bucket in group | ✅ Ready |
+| Local-time weather path | `wx_observations.local_hour`, `is_in_peak_window`, station timezone, orderbook repricing after local milestones | ✅ Ready |
+| Station reliability | forecast error, proxy/source mismatch rate, intraday volatility, late-day new highs, liquidity/spread/repricing metrics | ⛔ Blocked — needs WU adapter + multiple models + 2+ weeks of data |
+| Bucket adjacency / hedge quality | bucket intervals, neg-risk group, executable bid/ask/size, settlement outcome, capital-at-risk model | ⛔ Blocked — WU adapter missing; no confirmed settlement values |
 
 This matrix is the build contract. `scripts/init_db.py` must create every field needed here,
 and analysis scripts should fail loudly when required data is absent.
@@ -982,6 +1028,12 @@ exactly midnight (00:00), the date being measured is the previous local date (We
 edge case). Cleaner: `settlement_date = close_utc.astimezone(tz).date()` except when
 `close_utc.astimezone(tz).time() == midnight`, subtract one day.
 
+**Note — `_close_time_from_event` fallback is fragile**: `discover_markets.py` has a
+fallback `f"{day.isoformat()}T12:00:00Z"` when `event.get("endDate")` is missing or
+malformed. This is correct today (all markets close at 12:00 UTC) but silently wins if
+Polymarket ever changes the close time. Add a warning log whenever the fallback fires so
+deviations from the confirmed universal close time are immediately visible.
+
 **Fields removed from schema** (were based on wrong model):
 - ~~`settlement_window_hours`~~ — removed. Not a meaningful concept given two-clock model.
 
@@ -1010,9 +1062,7 @@ This will fail silently when fetches happen near UTC midnight for UTC+ stations.
       (scraped from settled Seoul/NYC markets: `end_date_iso = '2026-MM-DDT12:00:00Z'`)
 - [x] **Fix open-meteo timezone**: pass `timezone=<station tz>` per model request
       so `forecast_date` is in station's local calendar, not UTC
-- [ ] **Run ICON, MF, GEM**: only GFS collected so far
 - [x] Create `scripts/init_db.py` as single schema owner; apply new schema
-- [ ] ECMWF direct via `ecmwf-opendata` (3h faster than open-meteo mirror)
 - [x] `discover_markets.py` refined: populate `weather_markets` table including
       confirmed CLOB fields: `game_start_time_utc`, `neg_risk_market_id`,
       `neg_risk_request_id`, `accepting_order_ts_utc`; set `close_time_utc` from
@@ -1020,9 +1070,35 @@ This will fail silently when fetches happen near UTC midnight for UTC+ stations.
       `settlement_rounding_rule`, units, bucket ranges, and raw market JSON
 - [x] `log_orderbooks.py`: compute `hours_to_close`, assign nullable `snapshot_label`,
       store sizes/depth/spread/raw book JSON
-- [ ] Add `fetch_settlement_sources.py`: HKO and NOAA WRH adapters are built; WU and
-      Polymarket/UMA final adapters still pending
 - [x] `settle_markets.py`: apply proxy settlement values to bucket-level `proxy_outcome`
+
+**Open — blocking settlement analysis (must fix before Phase 2):**
+
+- [ ] **⛔ Build `wunderground_daily` adapter** in `fetch_settlement_sources.py` — ~82% of
+      markets (London, Paris, Tokyo, Seoul, Beijing, Singapore, Madrid, Munich, Amsterdam,
+      Ankara, Wellington, Shenzhen, Guangzhou, NYC, Miami) use WU as settlement source.
+      Until this adapter exists, `settlement_value_proxy` is NULL and `proxy_outcome` is
+      never populated for these cities. HKO and NOAA adapters are built; WU is the gap.
+- [ ] **Fix `settlement_date` stored as UTC loop date in `discover_markets.py`**: currently
+      `day.isoformat()` uses the UTC iteration date, not the station's local date. Correct
+      derivation per-city using `close_time_utc` + station timezone (Wellington edge case:
+      subtract 1 day when local close is exactly midnight). See "Analysis Query Correctness"
+      section for the canonical formula.
+- [ ] **Fix `_snapshot_label` thresholds in `log_orderbooks.py`**: current thresholds are
+      `[0.5, 1, 2, 4, 8, 12, 24]` — missing T-3h and T-6h, extra T-2h/T-4h/T-8h. Fix to
+      `[0.5, 1, 3, 6, 12, 24]`.
+- [ ] **Fix `open` label never firing**: add `first_seen_utc` to `_load_active_markets`
+      SELECT; in `_snapshot_market` check if current snapshot is within 5 min of
+      `first_seen_utc` and no prior `open` label exists for this `condition_id`.
+- [ ] **Fix active market filter for Type C cities**: change `settlement_date >= date('now')`
+      to `settlement_date >= date('now', '-1 day')` so NYC/Miami are not dropped from
+      monitoring after UTC midnight when their local day (and temperature window) continues.
+
+**Open — collection completeness:**
+
+- [ ] **Run ICON, MF, GEM**: only GFS collected so far; 3 of 6 forecast models missing;
+      blocks "Forecast consensus vs market" and "Best forecast timing by station" tests
+- [ ] ECMWF direct via `ecmwf-opendata` (3h faster than open-meteo mirror)
 - [ ] Final Polymarket/UMA reconciliation: write `settlement_value_final`, apply final
       bucket-aware outcome, and compare final vs proxy
 - [ ] Full scheduled loop running continuously
