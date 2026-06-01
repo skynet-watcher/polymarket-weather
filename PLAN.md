@@ -202,6 +202,19 @@ reflects how well our proxy matched.
 No analysis script may treat `proxy_only` rows as `confirmed`. Transition from `proxy_only`
 to `confirmed` or `disputed` requires a completed Polymarket/UMA reconciliation run.
 
+**Market cancellation**: Polymarket can cancel a market (e.g. settlement source unavailable).
+Cancelled markets have prices snap to 0.50 across all buckets and eventually refund positions.
+The plan's `resolved_outcome` field only accepts 'YES' | 'NO' — cancellation has no state.
+
+Required additions:
+- Add `'cancelled'` to valid `resolution_status` values in both `weather_markets` and `market_resolutions`.
+- Add `cancelled_at_utc TEXT` to `weather_markets` schema.
+- Detection heuristic: if all YES mids for a city+date simultaneously converge to 0.48–0.52 outside
+  of normal trading hours, flag `alert_type='possible_market_cancellation'` for manual review.
+- `settle_markets.py` must skip markets with `resolution_status='cancelled'` — do not apply
+  settlement values to cancelled markets, as `proxy_outcome` would be meaningless.
+- `market_resolutions.resolved_outcome` must accept `'CANCELLED'` alongside 'YES' and 'NO'.
+
 ### All weather staircase markets are neg-risk markets
 
 Confirmed from CLOB API: `neg_risk: true` for every weather bucket market.
@@ -223,14 +236,27 @@ P_sum(T)    = sum of YES executable asks for all exact/range buckets where lower
 gap(T)      = P_above(T) - P_sum(T)
 ```
 
-If `gap(T) > 2¢`, flag as `neg_risk_gap`. Use executable prices (bid for the side you
-sell, ask for the side you buy), not midpoints — a 2¢ midpoint gap routinely disappears
+If `gap(T) > 2¢`, flag as `neg_risk_gap_forward`. Use executable prices (bid for the side
+you sell, ask for the side you buy), not midpoints — a 2¢ midpoint gap routinely disappears
 at executable size. The 2¢ threshold accounts for ~1¢ bid-ask on each leg of a 2-leg
 trade; gaps below this are within normal spread noise.
 
+**Both directions must be checked**. The inverse gap — staircase sum overpriced relative
+to the above_eq bucket — is an equally valid arbitrage signal:
+
+```
+forward_gap(T) = P_above(bid) - P_sum(ask)   → sell above_eq, buy constituent buckets
+reverse_gap(T) = P_sum(bid)   - P_above(ask) → buy above_eq, sell constituent buckets
+```
+
+Flag `forward_gap > 2¢` as `alert_type='neg_risk_gap_forward'`.
+Flag `reverse_gap > 2¢` as `alert_type='neg_risk_gap_reverse'`.
+Additionally, run a full-staircase sanity check: `sum of all YES executable bids ≈ $1.00`
+(within 3¢ of neg-risk netting). Violations indicate a malformed staircase or data error.
+
 If no `above_eq` bucket exists for a given staircase (some markets only have exact and
-range buckets), the constraint cannot be checked — log this as a scanner limitation in
-`alerts` with `alert_type = 'scanner_no_above_eq_bucket'`.
+range buckets), the directional constraint cannot be checked — log this as a scanner
+limitation in `alerts` with `alert_type='scanner_no_above_eq_bucket'`.
 
 **2. Capital efficiency for multi-leg trades**
 Polymarket's neg-risk collateral netting applies. Buying NO on multiple buckets
@@ -284,6 +310,50 @@ Every adapter stores normalized values plus raw payloads. If a market names an u
 source, discovery should still store the market but mark `resolution_source_type='unknown'`
 and prevent strategy conclusions until a source adapter exists.
 
+**`bucket_type='unknown'` is a first-class failure state**, not a silent skip. When
+`_parse_bucket()` returns `'unknown'` (question text matched no regex), the market is
+stored but flagged. Required behavior across all scripts:
+
+- `discover_markets.py`: insert `alert_type='unparseable_bucket'` for any market with
+  `bucket_type='unknown'`. Log the full question text for manual regex debugging.
+- `settle_markets.py`: skip markets with `bucket_type='unknown'` — do not attempt to
+  compute `proxy_outcome`. Log a warning.
+- `neg_risk_scanner.py`: exclude `bucket_type='unknown'` markets from all scanner queries.
+  A staircase with an unknown-type bucket cannot be validated.
+- Analysis queries: always add `AND bucket_type != 'unknown'` when computing settlement
+  outcomes. An unknown bucket in a neg-risk group breaks the full-staircase sum constraint.
+
+The `unparseable_bucket` alert must include the `condition_id`, `question` text, and
+`city` so the regex can be extended to cover the new format.
+
+**WU adapter: access method, authentication, and URL stability must be decided before building.**
+
+WU's free API was discontinued in 2018. Three access paths exist, each with trade-offs:
+
+| Method | Notes |
+|--------|-------|
+| `api.weather.com` paid API | Requires WU API key ($); stable JSON endpoint; recommended |
+| PWS partner API | Free with WU PWS account; may not cover all 15 WU stations |
+| HTML scraping | Against WU ToS; URL format changes frequently; brittle |
+
+The `resolution_source_url` stored from market rules is a display URL (e.g.
+`wunderground.com/history/daily/KLGA/date/2026-6-1`). This URL format changes and should
+NOT be fetched directly. Re-derive the API endpoint from the station code and date at
+fetch time, not from the stored URL.
+
+**Credentials required per adapter:**
+
+| Adapter | Credential | Where |
+|---------|-----------|-------|
+| `wunderground_daily` | WU API key | `WU_API_KEY` env var |
+| `noaa_wrh_timeseries` | Synoptic Data API token | `SYNOPTIC_TOKEN` env var |
+| `hong_kong_observatory_daily` | None (public CSV) | — |
+| `polymarket_final` | None (public API) | — |
+
+All credentials must be loaded from environment variables, never hardcoded. Add credential
+validation at startup: if `WU_API_KEY` is absent and WU markets exist in the DB, log an
+error and skip WU markets rather than silently producing no data.
+
 ### Rules-first discovery
 
 Market discovery is rules-first:
@@ -296,6 +366,23 @@ Market discovery is rules-first:
 5. Use `data/city_stations.json` only as enrichment/cache.
 
 No analysis should depend on manually maintained station assumptions when live rules disagree.
+
+**Event slug format is fragile — mismatch causes silent total discovery failure.**
+
+`_event_slug()` generates slugs like `highest-temperature-in-hong-kong-on-june-1-2026`.
+If Polymarket changes the slug format (year format, prepositions, hyphenation, city name),
+the Gamma API returns HTTP 404 and the city is silently skipped — no error, no alert, no
+data for that city for that day.
+
+Required safeguards:
+- After each discovery run, count how many cities returned zero markets for today's date.
+  If ≥3 cities return zero markets (and it is not extremely early in the day), insert
+  `alert_type='discovery_slug_failure'` — this signals a likely slug format change, not
+  genuinely absent markets.
+- `city_stations.json` slug field must be verified against at least one known-live Gamma
+  response on startup. Log the first successful slug match per run to confirm format.
+- If all cities return 404 for a given offset, stop and alert immediately rather than
+  continuing through all 17 × 3 = 51 slug attempts.
 
 ---
 
@@ -311,6 +398,19 @@ a final daily summary that may differ (rounding, QA, data cutoff time).
 ICAO, ~13km from HKO Observatory). HKO does not publish METAR; VHHH is the nearest
 aviation-grade instrument. Treat HK METAR readings as approximate — HKO settlement values
 will differ. All 17 in a single batch API call.
+
+**Station coverage validation required after every fetch**: compare the set of ICAO codes
+returned in the API response against the 17 configured stations. If any station is absent:
+
+- Log a per-station warning immediately.
+- Insert `alert_type='fetch_failure'` for the missing station.
+- Do not treat a silent omission as success — `n_records` in `fetch_log` must reflect
+  actual stations received, not stations requested.
+
+If the API returns an error for the full batch (not a per-station omission), do not fall
+through to inserting zero records — log `status='failed'` and trigger the retry. A single
+bad station code in the batch request can cause the API to reject all 17 — test station
+codes against the live API individually if a batch repeatedly fails.
 **Key fields**:
 - `temp` → `temp_c`: current 2m temperature
 - `reportTime` → `observed_utc`: when the reading was taken at the station (stored separately
@@ -392,14 +492,25 @@ Tokyo (00z +24h = 00:00 UTC = 09:00 JST), missing the afternoon peak entirely.
 
 Correct extraction per station:
 ```python
-# window = [temp_window_start_utc, temp_window_start_utc + 24h)
+# window = [temp_window_start_utc, next_local_midnight_utc)
+# Do NOT use temp_window_start_utc + 24h — DST transition days are 23h or 25h.
+from zoneinfo import ZoneInfo
+from datetime import datetime, timedelta, timezone
 window_start = datetime.fromisoformat(temp_window_start_utc)
-window_end = window_start + timedelta(hours=24)
+# Compute next local midnight correctly (handles 23h spring-forward and 25h fall-back):
+window_start_local = window_start.astimezone(ZoneInfo(station_tz))
+next_day_local = window_start_local.date() + timedelta(days=1)
+window_end = datetime(next_day_local.year, next_day_local.month, next_day_local.day,
+                      tzinfo=ZoneInfo(station_tz)).astimezone(timezone.utc)
 valid_steps = [s for s in grib_steps if window_start <= run_time + timedelta(hours=s) < window_end]
 daily_high_c = max(grib_2t[step][lat_idx, lon_idx] for step in valid_steps)
 ```
-Store the first and last step used in `raw_payload_json` for audit. Never derive the step
-window from UTC calendar date — it will be wrong for every UTC+ station after 00:00 UTC.
+Store the first and last step used, and `window_end`, in `raw_payload_json` for audit.
+Never use `+ timedelta(hours=24)` to bound the temperature window — it is wrong on DST
+transition days (spring-forward = 23h local day, fall-back = 25h local day). This same
+ZoneInfo-aware `window_end` derivation must be used anywhere the end of the temperature
+window is computed: METAR daily high queries, ECMWF step selection, settle_markets.py
+timing checks, and obs_mismatch alert suppression for Type C cities.
 
 #### 3. GFS (Global Forecast System)
 **Source**: `api.open-meteo.com` — model `gfs_seamless`
@@ -598,6 +709,26 @@ ORDER BY ob.ts_utc, wm.lower_temp
 Scheduler computes next intended fetch time from model run times and offsets after each job
 completes — not a naive interval — to prevent drift from actual model cadence.
 
+**`settle_markets.py` trigger — must be defined explicitly.** The plan documents per-city
+settle times but never defines what triggers the script. Without a trigger, settlement
+never runs automatically and all markets stay `resolution_status=NULL` forever.
+
+Required trigger condition (poll every 15 minutes from a continuous loop or cron):
+```sql
+-- Markets ready to settle: local day complete + ~2h source finalization buffer
+SELECT condition_id, city, settlement_date, temp_window_start_utc
+FROM weather_markets
+WHERE settlement_value_proxy IS NULL
+  AND resolution_status IS NULL
+  AND active = 1
+  AND datetime(temp_window_start_utc, '+26 hours') < datetime('now')
+```
+
+The `+26 hours` offset (24h local day + 2h source finalization) is an approximation.
+For cities where the source is known to finalize faster (HKO ~1h), this can be tightened.
+For cities where WU is known to be slow (~3h), allow `+27 hours`. Store per-city finalization
+offsets in `city_stations.json` as `source_finalization_hours` (default: 2).
+
 ---
 
 ## Retry Policy
@@ -621,6 +752,33 @@ any European station and no operator notification. Required behavior:
 - Add `fetch_failure` to the valid `alert_type` enumeration alongside `neg_risk_gap`,
   `obs_mismatch`, `forecast_divergence`, `convergence`, `incomplete_market_data`,
   `settlement_integrity_error`, and `scanner_no_above_eq_bucket`.
+
+---
+
+## Database Concurrency
+
+Multiple scripts run simultaneously: `fetch_weather.py`, `log_orderbooks.py`,
+`discover_markets.py`, `fetch_settlement_sources.py`, `settle_markets.py`, and
+`neg_risk_scanner.py` all write to `weather.db`. SQLite's default journal mode (`DELETE`)
+allows only one writer at a time with an exclusive lock. Without explicit configuration,
+concurrent writers will receive `OperationalError: database is locked`. The HTTP retry
+logic in `with_retry()` handles HTTP errors — not database errors — so lock failures will
+propagate uncaught and drop data silently.
+
+**Required configuration in `init_db()`**:
+```python
+conn.execute("PRAGMA journal_mode=WAL")      # concurrent readers + one writer, short lock windows
+conn.execute("PRAGMA busy_timeout=10000")    # wait up to 10s for lock before raising
+conn.execute("PRAGMA synchronous=NORMAL")    # safe with WAL; faster than FULL
+```
+
+WAL mode allows multiple concurrent readers and one writer with millisecond-level lock
+windows instead of full-transaction exclusive locks. The 10-second busy timeout gives
+concurrent writers time to retry rather than immediately failing.
+
+**Database error handling**: lock errors (`OperationalError: database is locked`) must be
+caught separately from HTTP errors and retried with a short sleep (0.5–2s), NOT the 180s
+HTTP retry interval. Add a `with_db_retry()` wrapper distinct from `with_retry()`.
 
 ---
 
@@ -805,13 +963,30 @@ CREATE INDEX IF NOT EXISTS ix_fetchlog_ts     ON fetch_log(ts_utc);
 CREATE INDEX IF NOT EXISTS ix_fetchlog_source ON fetch_log(source, ts_utc);
 
 -- Flagged opportunities
+-- Deduplication: before inserting, check for an existing open alert of the same
+-- (city, alert_type, settlement_date). If one exists and status='open', UPDATE its
+-- detail_json and last_seen_utc rather than inserting a new row. Insert a new row only
+-- when a genuinely new alert opens, or when a previously closed alert re-opens.
+-- Without deduplication, a persistent 2-hour neg-risk gap generates 24+ identical rows
+-- and the table becomes operationally unusable.
+--
+-- Valid alert_type values:
+--   neg_risk_gap_forward | neg_risk_gap_reverse | obs_mismatch | forecast_divergence |
+--   convergence | fetch_failure | incomplete_market_data | settlement_integrity_error |
+--   scanner_no_above_eq_bucket | unparseable_bucket | discovery_slug_failure |
+--   possible_market_cancellation | stale_run
 CREATE TABLE alerts (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    ts_utc      TEXT NOT NULL,
-    city        TEXT NOT NULL,
-    alert_type  TEXT NOT NULL,              -- neg_risk_gap | obs_mismatch | forecast_divergence | convergence
-    detail_json TEXT
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    opened_utc      TEXT NOT NULL,          -- when this alert was first inserted
+    last_seen_utc   TEXT NOT NULL,          -- updated on each scan cycle while still open
+    city            TEXT NOT NULL,
+    settlement_date TEXT,                   -- YYYY-MM-DD local date this alert relates to (nullable for infra alerts)
+    alert_type      TEXT NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'open',   -- 'open' | 'closed'
+    closed_utc      TEXT,                   -- set when gap closes or condition resolves
+    detail_json     TEXT
 );
+CREATE INDEX IF NOT EXISTS ix_alerts_open ON alerts(city, alert_type, status, settlement_date);
 
 -- Normalized settlement-source observations (WU/HKO/NOAA/etc.)
 -- Multiple rows per (city, local_date, source_type) are expected — each fetch run inserts
@@ -1518,6 +1693,44 @@ This will fail silently when fetches happen near UTC midnight for UTC+ stations.
       VHHH `daily_high` to HKO `settlement_observations.value` for the same local date.
       Until calibrated, HK obs_mismatch alerts must carry an explicit "uncalibrated proxy"
       caveat. Add this as a Phase 3 analysis task.
+
+**Open — blocking pre-build items (fourth audit round):**
+
+- [ ] **🔴 Enable SQLite WAL mode and busy timeout in `init_db()`**: add
+      `PRAGMA journal_mode=WAL`, `PRAGMA busy_timeout=10000`, `PRAGMA synchronous=NORMAL`.
+      Add `with_db_retry()` wrapper for lock errors (short sleep, not 180s HTTP retry).
+      Without this, concurrent script operation produces intermittent silent data loss.
+- [ ] **🔴 Define and implement WU adapter access method**: decide between paid
+      `api.weather.com`, PWS API, or alternative. Store credentials in `WU_API_KEY`
+      env var. Re-derive API endpoint from station code + date at fetch time — do not
+      fetch the stored `resolution_source_url` directly. Add startup credential validation.
+      Document `SYNOPTIC_TOKEN` env var for NOAA adapter.
+- [ ] **🔴 Implement `settle_markets.py` continuous trigger**: add polling loop that
+      checks every 15 minutes for markets where
+      `datetime(temp_window_start_utc, '+26 hours') < datetime('now')` and
+      `settlement_value_proxy IS NULL`. Add `source_finalization_hours` (default 2) to
+      `city_stations.json` for per-city tuning.
+- [ ] **Add market cancellation handling**: add `'cancelled'` to `resolution_status`
+      and `market_resolutions.resolved_outcome`; add `cancelled_at_utc` to schema;
+      add detection heuristic (all YES mids → 0.50); skip cancelled markets in
+      `settle_markets.py`.
+- [ ] **Add event slug validation and failure detection**: alert on ≥3 cities returning
+      zero markets; log first successful slug match per run; stop early if all cities
+      return 404 for a given offset.
+- [ ] **Use ZoneInfo-aware window end everywhere**: replace all `+ timedelta(hours=24)`
+      temperature window bounds with the next-local-midnight derivation. Affects ECMWF
+      step selection, METAR daily high queries, settle_markets.py timing, and Type C
+      obs_mismatch suppression. DST transition days are 23h or 25h — fixed 24h is wrong.
+- [ ] **Handle `bucket_type='unknown'` explicitly in all scripts**: alert on discovery,
+      skip in settle_markets.py and scanner, exclude from analysis queries.
+- [ ] **Add `alerts` table deduplication**: add `status`, `opened_utc`, `last_seen_utc`,
+      `closed_utc`, `settlement_date` columns; scanner updates existing open alerts
+      rather than inserting duplicates; alert closes when condition resolves.
+- [ ] **Implement both neg-risk gap directions**: check `forward_gap` and `reverse_gap`
+      with separate alert types; add full-staircase sum sanity check (sum bids ≈ $1.00).
+- [ ] **Add METAR station coverage validation**: after every batch fetch, compare
+      returned station set against configured 17; alert per missing station; do not
+      count batch as success if any station is silently absent.
 
 **Open — collection completeness:**
 
