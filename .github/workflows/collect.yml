@@ -1,3 +1,6 @@
+# PUBLIC REPO — GitHub Actions is free with no minutes limit for public repos.
+# Every 10 minutes is fine at zero cost.
+
 name: Collect — METAR, Forecasts, Order Books
 
 # Runs every 10 minutes. Handles:
