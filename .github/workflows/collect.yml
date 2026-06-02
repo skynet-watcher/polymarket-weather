@@ -1,0 +1,128 @@
+name: Collect — METAR, Forecasts, Order Books
+
+# Runs every 10 minutes. Handles:
+#   - METAR (every run)
+#   - Order book snapshots (every run)
+#   - Model forecasts (once per hour, time-gated in Python)
+#   - TAF (4× per day, time-gated)
+#   - Proxy settlement outcomes (every run, instant if nothing due)
+#
+# Discovery runs in a separate daily workflow (discover.yml).
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+# Never run two collection jobs at the same time — they share the DB cache
+concurrency:
+  group: collect
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install --quiet httpx aiohttp python-dateutil
+
+      # Restore the most recent DB from cache
+      - name: Restore DB
+        uses: actions/cache/restore@v4
+        with:
+          path: weather.db
+          key: weather-db-${{ github.run_id }}
+          restore-keys: weather-db-
+
+      - name: Init DB schema
+        run: python scripts/init_db.py
+
+      # METAR — every 10 min
+      - name: METAR
+        run: python scripts/fetch_weather.py --metar
+        continue-on-error: true
+
+      # Order books — every 10 min
+      - name: Order books
+        run: python scripts/log_orderbooks.py --once
+        continue-on-error: true
+
+      # Model forecasts + TAF — time-gated via Python
+      # Models run once per hour (at :00-:10 window)
+      # TAF runs at 00:xx, 06:xx, 12:xx, 18:xx UTC
+      - name: Forecasts (time-gated)
+        run: |
+          python3 - <<'EOF'
+          import subprocess, datetime as dt, sys
+
+          now   = dt.datetime.now(dt.timezone.utc)
+          hour  = now.hour
+          minute= now.minute
+
+          # TAF: run at :00-:10 of 00, 06, 12, 18 UTC
+          if hour % 6 == 0 and minute < 15:
+              print(f"Running TAF at {hour:02d}:{minute:02d} UTC")
+              r = subprocess.run(["python", "scripts/fetch_weather.py", "--taf"])
+              if r.returncode != 0:
+                  print("TAF failed (continuing)")
+
+          # Models: run once per hour at :00-:10 window
+          if minute < 15:
+              print(f"Running all 5 model forecasts at {hour:02d}:{minute:02d} UTC")
+              r = subprocess.run(["python", "scripts/fetch_weather.py", "--forecasts"])
+              if r.returncode != 0:
+                  print("Model fetch failed (continuing)")
+          else:
+              print(f"Skipping models (minute={minute}, only run at :00-:14)")
+          EOF
+        continue-on-error: true
+
+      # Settlement sources — every 2h, time-gated
+      - name: Settlement sources (time-gated)
+        run: |
+          python3 - <<'EOF'
+          import subprocess, datetime as dt
+          now = dt.datetime.now(dt.timezone.utc)
+          # Run at :00-:10 of even hours
+          if now.hour % 2 == 0 and now.minute < 15:
+              print(f"Running settlement sources at {now.hour:02d}:{now.minute:02d} UTC")
+              subprocess.run(["python", "scripts/fetch_settlement_sources.py"])
+          else:
+              print("Skipping settlement sources (not on 2h boundary)")
+          EOF
+        continue-on-error: true
+
+      # Apply proxy outcomes (instant if nothing eligible)
+      - name: Apply settlement outcomes
+        run: python scripts/settle_markets.py --once
+        continue-on-error: true
+
+      # Summary
+      - name: DB summary
+        run: |
+          python3 -c "
+          import sqlite3, datetime as dt
+          c = sqlite3.connect('weather.db')
+          now = dt.datetime.now(dt.timezone.utc).strftime('%H:%M UTC')
+          rows = lambda t: c.execute(f'SELECT COUNT(*) FROM {t}').fetchone()[0]
+          print(f'[{now}] obs={rows(\"wx_observations\")} snaps={rows(\"ob_snapshots\")} forecasts={rows(\"model_forecasts\")} markets={rows(\"weather_markets\")} settled={c.execute(\"SELECT COUNT(*) FROM weather_markets WHERE proxy_outcome IS NOT NULL\").fetchone()[0]}')
+          "
+
+      # Save DB back to cache
+      - name: Save DB
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: weather.db
+          key: weather-db-${{ github.run_id }}

@@ -1,0 +1,85 @@
+name: Discover Markets (daily)
+
+# Runs once per day at 00:05 UTC.
+# Also triggers on push to main so any schema changes are applied immediately.
+# Takes 5-8 minutes (17 cities × 3 days × Gamma + CLOB API calls).
+
+on:
+  schedule:
+    - cron: '5 0 * * *'
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/discover_markets.py'
+      - 'scripts/init_db.py'
+      - 'data/city_stations.json'
+  workflow_dispatch:
+
+concurrency:
+  group: collect      # same group as collect.yml — wait for any in-flight collection
+  cancel-in-progress: false
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install --quiet httpx aiohttp python-dateutil
+
+      - name: Restore DB
+        uses: actions/cache/restore@v4
+        with:
+          path: weather.db
+          key: weather-db-${{ github.run_id }}
+          restore-keys: weather-db-
+
+      - name: Init DB schema
+        run: python scripts/init_db.py
+
+      - name: Discover markets (days-ahead 2)
+        run: python scripts/discover_markets.py --days-ahead 2
+
+      - name: Deactivate stale markets
+        run: |
+          python3 -c "
+          import sqlite3, datetime as dt
+          conn = sqlite3.connect('weather.db')
+          cutoff = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=48)).isoformat()
+          n = conn.execute('UPDATE weather_markets SET active=0 WHERE active=1 AND close_time_utc < ?', (cutoff,)).rowcount
+          conn.commit()
+          print(f'Deactivated {n} stale markets')
+          "
+
+      - name: Market summary
+        run: |
+          python3 -c "
+          import sqlite3
+          c = sqlite3.connect('weather.db')
+          rows = c.execute('''
+              SELECT city, settlement_date, COUNT(*) as n, bucket_unit,
+                     SUM(CASE WHEN active=1 THEN 1 ELSE 0 END) as active
+              FROM weather_markets
+              GROUP BY city, settlement_date
+              ORDER BY settlement_date, city
+          ''').fetchall()
+          for r in rows:
+              print(f'  {r[0]:12s} {r[1]}  {r[4]}/{r[2]} active  {r[3]}')
+          "
+
+      - name: Save DB
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: weather.db
+          key: weather-db-${{ github.run_id }}
