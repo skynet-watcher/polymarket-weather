@@ -122,6 +122,20 @@ jobs:
           print(f'[{now}] obs={rows(\"wx_observations\")} snaps={rows(\"ob_snapshots\")} forecasts={rows(\"model_forecasts\")} markets={rows(\"weather_markets\")} settled={c.execute(\"SELECT COUNT(*) FROM weather_markets WHERE proxy_outcome IS NOT NULL\").fetchone()[0]}')
           "
 
+      # ── Generate static dashboard → docs/index.html ─────────────────────────
+      - name: Generate dashboard
+        run: python scripts/generate_report.py --out docs/index.html
+
+      # ── Deploy to GitHub Pages ────────────────────────────────────────────
+      - name: Deploy to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./docs
+          commit_message: "dashboard update ${{ github.run_number }}"
+          force_orphan: false   # keep gh-pages branch history lean
+          enable_jekyll: false
+
       # Save DB back to cache
       - name: Save DB
         uses: actions/cache/save@v4
