@@ -14,6 +14,7 @@ Exit code: 0 if all run tests pass, 1 if any fail.
 from __future__ import annotations
 
 import argparse
+import tempfile
 import datetime as dt
 import json
 import os
@@ -25,7 +26,8 @@ import time
 from zoneinfo import ZoneInfo
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DB_PATH = os.path.join(REPO_ROOT, "weather.db")
+DEFAULT_DB_PATH = os.path.join(REPO_ROOT, "weather.db")
+DB_PATH = os.environ.get("WEATHER_TEST_DB", os.path.join(tempfile.gettempdir(), "polymarket_weather_tests.db"))
 sys.path.insert(0, os.path.join(REPO_ROOT, "scripts"))
 
 from init_db import init_db  # noqa: E402
@@ -91,7 +93,7 @@ def test_p01_schema_clean_init():
         "SELECT name FROM sqlite_master WHERE type='table'")}
     required = {
         "wx_observations", "taf_forecasts", "model_forecasts",
-        "weather_markets", "ob_snapshots", "fetch_log", "alerts",
+        "weather_markets", "ob_snapshots", "market_price_history", "fetch_log", "alerts",
         "settlement_observations", "market_resolutions",
     }
     missing_tables = required - tables
@@ -1094,9 +1096,12 @@ def main():
                         help="Include tests requiring live API access")
     args = parser.parse_args()
 
-    # Delete and recreate weather.db so tests start from a known state
-    if os.path.exists(DB_PATH):
-        os.remove(DB_PATH)
+    # Delete and recreate an isolated test database so tests start from a known state.
+    # Never point tests at the runtime weather.db unless WEATHER_TEST_DB is explicitly set.
+    for suffix in ("", "-wal", "-shm"):
+        path = DB_PATH + suffix
+        if os.path.exists(path):
+            os.remove(path)
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     init_db(conn)

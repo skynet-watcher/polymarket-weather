@@ -231,9 +231,11 @@ def _upsert_market(
     event: dict,
     market: dict,
     clob: dict | None,
+    discovery_source: str = "live_discovery",
 ) -> None:
     # Stamp first_seen_utc at the moment THIS market is processed, not batch start.
     first_seen_utc = _now()
+    is_backfill = discovery_source == "backfill"
 
     description    = market.get("description") or market.get("rules") or ""
     question       = market.get("question") or (clob or {}).get("question") or ""
@@ -274,9 +276,11 @@ def _upsert_market(
     )
 
     # Post-close guard: if we're discovering a market after its trading close, mark inactive
-    if first_seen_utc >= close_time_utc:
+    if first_seen_utc >= close_time_utc and not is_backfill:
         log.warning("Post-close discovery: %s (%s) close=%s first_seen=%s — setting active=0",
                     condition_id[:10], city["city"], close_time_utc, first_seen_utc)
+
+    market_start_utc = (clob or {}).get("accepting_order_timestamp")
 
     conn.execute("""
         INSERT INTO weather_markets (
@@ -285,10 +289,11 @@ def _upsert_market(
             yes_token_id, no_token_id, question, rules_text, rules_source,
             resolution_source_type, resolution_source_url, raw_market_json,
             temp_window_start_utc, close_time_utc, accepting_order_ts_utc,
-            neg_risk_market_id, neg_risk_request_id, first_seen_utc,
+            market_start_utc, neg_risk_market_id, neg_risk_request_id,
+            first_seen_utc, first_seen_source, backfilled_at_utc,
             settlement_rounding_rule, active
         )
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(condition_id) DO UPDATE SET
             event_slug=excluded.event_slug,
             market_slug=excluded.market_slug,
@@ -311,9 +316,12 @@ def _upsert_market(
             temp_window_start_utc=excluded.temp_window_start_utc,
             close_time_utc=excluded.close_time_utc,
             accepting_order_ts_utc=excluded.accepting_order_ts_utc,
+            market_start_utc=COALESCE(weather_markets.market_start_utc, excluded.market_start_utc),
             neg_risk_market_id=excluded.neg_risk_market_id,
             neg_risk_request_id=excluded.neg_risk_request_id,
             first_seen_utc=COALESCE(weather_markets.first_seen_utc, excluded.first_seen_utc),
+            first_seen_source=COALESCE(weather_markets.first_seen_source, excluded.first_seen_source),
+            backfilled_at_utc=COALESCE(weather_markets.backfilled_at_utc, excluded.backfilled_at_utc),
             settlement_rounding_rule=excluded.settlement_rounding_rule,
             active=CASE
                 WHEN excluded.first_seen_utc >= excluded.close_time_utc THEN 0
@@ -341,10 +349,13 @@ def _upsert_market(
         json.dumps({"gamma": market, "clob": clob}, sort_keys=True),
         temp_window_start_utc,
         close_time_utc,
-        (clob or {}).get("accepting_order_timestamp"),
+        market_start_utc,
+        market_start_utc,
         (clob or {}).get("neg_risk_market_id"),
         (clob or {}).get("neg_risk_request_id"),
         first_seen_utc,
+        discovery_source,
+        first_seen_utc if is_backfill else None,
         _rounding_rule(description),
         # active: 0 if post-close, 1 otherwise
         0 if first_seen_utc >= close_time_utc else 1,

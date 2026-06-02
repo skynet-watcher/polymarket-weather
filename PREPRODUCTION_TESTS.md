@@ -19,7 +19,8 @@ Each test specifies: what to run, what to check, and the pass/fail criterion.
 
 **Check**:
 - All tables exist: `wx_observations`, `taf_forecasts`, `model_forecasts`, `weather_markets`,
-  `ob_snapshots`, `fetch_log`, `alerts`, `settlement_observations`, `market_resolutions`.
+  `ob_snapshots`, `market_price_history`, `fetch_log`, `alerts`,
+  `settlement_observations`, `market_resolutions`.
 - All indexes exist (UNIQUE, covering, lookup).
 - `taf_forecasts` contains `forecast_local_date` column.
 - `weather_markets` contains `temp_window_start_utc`, `cancelled_at_utc`, `active`.

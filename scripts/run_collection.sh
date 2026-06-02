@@ -43,10 +43,17 @@ nohup $PYTHON "$REPO/scripts/log_orderbooks.py" \
     >> "$LOG/collection_orderbooks.log" 2>&1 &
 echo "  PID $! → logs/collection_orderbooks.log"
 
+# 4. Settlement application loop (checks every 15 minutes)
+echo "Starting settle_markets.py --loop ..."
+nohup $PYTHON "$REPO/scripts/settle_markets.py" --loop \
+    >> "$LOG/collection_settle.log" 2>&1 &
+echo "  PID $! → logs/collection_settle.log"
+
 echo ""
 echo "Collection running. Check status:"
 echo "  tail -f $LOG/collection_weather.log"
 echo "  tail -f $LOG/collection_orderbooks.log"
+echo "  tail -f $LOG/collection_settle.log"
 echo "  bash scripts/heartbeat.sh report"
 echo ""
 echo "Stop with: bash scripts/run_collection.sh --stop"

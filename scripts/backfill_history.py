@@ -5,7 +5,8 @@ Collect historical data for backtesting against past Polymarket weather markets.
 
 What this fetches per past date:
   1. Market definitions   — Gamma API (same as discover_markets.py, any past date)
-  2. Price history        — CLOB prices-history per token (~hourly resolution)
+  2. Price history        — CLOB prices-history per token (~hourly resolution),
+                            stored in market_price_history (not ob_snapshots)
   3. Settlement outcome   — resolved market price snaps to 0.0 or 1.0
   4. Archive weather      — open-meteo archive daily max (universal settlement proxy)
 
@@ -13,28 +14,21 @@ For authoritative settlement temperatures, run backfill_settlement.py AFTER this
 script — it fetches IEM ASOS (WU-equivalent), HKO historical, and open-meteo archive
 with proper source labelling and cross-validation.
 
-CRITICAL LIMITATION — historical NWP forecast signals:
-  The open-meteo historical forecast API returns ANALYSIS values (what each model
-  computed as its best estimate for each day), NOT the forecast issued at T-48h.
-  Values are identical regardless of what start_date you pass — the API collapses
-  all lead times into a single analysis value per date.
-
-  TRUE historical NWP forecast data at specific lead times (T-48h, T-24h, etc.) is
-  NOT available from any free API for dates more than ~14 days ago:
-    - NOAA NOMADS: only keeps GFS GRIB2 files for ~2 weeks
-    - ECMWF MARS: paid subscription required
-    - Reforecast datasets: available but require large GRIB downloads and processing
-
-  Forecast signal backtesting (Tests 2, 3, 4, 5, 9) requires LIVE forward collection.
-  fetch_weather.py has been collecting real T-48h, T-24h, T-12h forecasts since launch.
-  Meaningful forecast signal analysis will be available within 2-3 weeks.
+Historical NWP forecast signals:
+  Do not use the open-meteo archive API for forecast backtests; it returns analysis
+  values, not advance predictions. Use scripts/backfill_model_forecasts.py instead.
+  It pulls Open-Meteo Previous Runs and stores fixed-lead model forecasts in
+  model_forecasts. True market-open tests still require market_start_utc/first_seen_utc
+  and live order books.
 
 What this backfill CAN support for backtesting:
   Test 6  Neg-risk gaps              — hourly price history shows past gap windows
   Test 7  Resolution source mismatch — archive proxy vs resolved Polymarket outcome
-  Test 8  Liquidity filter           — spread visible in hourly price data (approximate)
-  Test 2  Market-open accuracy       — market opening price vs settlement (limited: no
-                                       forecast to compare against, only market price)
+  Test 8  Liquidity filter           — NOT supported by price-history backfill; requires
+                                       live order book snapshots with bid/ask/size
+  Test 2  Market-open accuracy       — requires scripts/backfill_model_forecasts.py
+                                       for historical forecasts, plus live/book data
+                                       for executable open prices.
 
 Usage:
     python scripts/backfill_history.py --days 30        # last 30 days
@@ -84,12 +78,12 @@ async def _fetch_price_history(
     token_id: str,
     condition_id: str,
     conn: sqlite3.Connection,
+    outcome: str | None = None,
 ) -> int:
-    """Fetch hourly price history from CLOB and store as ob_snapshots.
+    """Fetch hourly price history from CLOB and store as market_price_history.
 
     CLOB prices-history returns {t: unix_timestamp, p: price} points.
-    We store as ob_snapshots with yes_ask=p (best approximation without depth).
-    hours_to_close and snapshot_label are computed from close_time_utc.
+    It is not an order book: it has no bid, ask, spread, size, or depth.
     """
     try:
         r = await client.get(
@@ -103,13 +97,6 @@ async def _fetch_price_history(
         if not history:
             return 0
 
-        # Get market metadata for hours_to_close computation
-        mkt = conn.execute(
-            "SELECT close_time_utc, first_seen_utc FROM weather_markets WHERE condition_id=?",
-            (condition_id,)
-        ).fetchone()
-        close_time_utc = mkt["close_time_utc"] if mkt else None
-
         saved = 0
         for point in history:
             ts_unix = point.get("t")
@@ -118,27 +105,15 @@ async def _fetch_price_history(
                 continue
 
             ts_utc = dt.datetime.fromtimestamp(ts_unix, tz=dt.timezone.utc).isoformat()
-            hours_to_close = None
-            if close_time_utc:
-                close_dt = dt.datetime.fromisoformat(
-                    close_time_utc.replace("Z", "+00:00")
-                )
-                snap_dt = dt.datetime.fromtimestamp(ts_unix, tz=dt.timezone.utc)
-                hours_to_close = round((close_dt - snap_dt).total_seconds() / 3600, 4)
-
-            # Snapshot label (simplified — price-history only, no depth)
-            label = _label_from_htc(hours_to_close)
-
             conn.execute("""
-                INSERT OR IGNORE INTO ob_snapshots
-                    (condition_id, ts_utc, yes_ask, yes_mid,
-                     hours_to_close, snapshot_label, raw_book_json)
-                VALUES (?,?,?,?,?,?,?)
+                INSERT OR IGNORE INTO market_price_history
+                    (token_id, condition_id, outcome, ts_utc, price,
+                     fidelity_minutes, source, raw_payload_json)
+                VALUES (?,?,?,?,?,?,?,?)
             """, (
-                condition_id, ts_utc,
-                float(price), float(price),    # mid = ask (no depth available)
-                hours_to_close, label,
-                json.dumps({"source": "prices_history", "t": ts_unix, "p": price}),
+                token_id, condition_id, outcome, ts_utc, float(price),
+                60, "clob_prices_history",
+                json.dumps({"t": ts_unix, "p": price, "token_id": token_id, "outcome": outcome}),
             ))
             saved += 1
 
@@ -147,20 +122,6 @@ async def _fetch_price_history(
     except Exception as e:
         log.warning("prices-history failed for %s: %s", token_id[:12], e)
         return 0
-
-
-def _label_from_htc(htc: float | None) -> str | None:
-    if htc is None:
-        return None
-    if htc < 0:
-        return "post_close"
-    for threshold, label in [
-        (0.5, "T-30min"), (1.0, "T-1h"), (3.0, "T-3h"),
-        (6.0, "T-6h"), (12.0, "T-12h"), (24.0, "T-24h"),
-    ]:
-        if htc <= threshold:
-            return label
-    return "open_window"
 
 
 # ── open-meteo archive (settlement weather proxy) ────────────────────────────
@@ -235,16 +196,20 @@ async def _fetch_settlement_outcome(
     client: httpx.AsyncClient,
     condition_id: str,
     conn: sqlite3.Connection,
+    clob_data: dict | None = None,
 ) -> bool:
     """Infer settlement outcome from resolved CLOB market prices.
 
     Resolved markets have prices snapped to 0.0 (NO) or 1.0 (YES).
     """
     try:
-        r = await client.get(f"{CLOB_BASE}/markets/{condition_id}", timeout=10)
-        if r.status_code != 200:
-            return False
-        data = r.json()
+        if clob_data is None:
+            r = await client.get(f"{CLOB_BASE}/markets/{condition_id}", timeout=10)
+            if r.status_code != 200:
+                return False
+            data = r.json()
+        else:
+            data = clob_data
         tokens = data.get("tokens", [])
         if not tokens:
             return False
@@ -282,6 +247,48 @@ async def _fetch_settlement_outcome(
         return False
 
 
+def _infer_gamma_settlement_outcome(
+    market: dict,
+    condition_id: str,
+    conn: sqlite3.Connection,
+) -> bool:
+    """Infer settlement from Gamma outcomePrices when CLOB detail is skipped."""
+    try:
+        raw_outcomes = market.get("outcomes")
+        raw_prices = market.get("outcomePrices")
+        outcomes = json.loads(raw_outcomes) if isinstance(raw_outcomes, str) else raw_outcomes
+        prices = json.loads(raw_prices) if isinstance(raw_prices, str) else raw_prices
+        if not outcomes or not prices:
+            return False
+
+        pairs = dict(zip(outcomes, prices))
+        yes_price = pairs.get("Yes")
+        if yes_price is None:
+            return False
+
+        yes_price = float(yes_price)
+        if yes_price >= 0.99:
+            outcome = "YES"
+        elif yes_price <= 0.01:
+            outcome = "NO"
+        else:
+            return False
+
+        conn.execute("""
+            INSERT OR IGNORE INTO market_resolutions
+                (condition_id, resolved_outcome, resolution_status, resolved_at_utc, raw_payload_json)
+            VALUES (?,?,?,?,?)
+        """, (
+            condition_id, outcome, "confirmed",
+            dt.datetime.now(dt.timezone.utc).isoformat(),
+            json.dumps({"gamma": market, "settlement_source": "gamma_outcomePrices"}),
+        ))
+        return True
+    except Exception as e:
+        log.debug("gamma settlement outcome failed for %s: %s", condition_id[:10], e)
+        return False
+
+
 # ── Main backfill loop ────────────────────────────────────────────────────────
 
 async def backfill(
@@ -289,6 +296,8 @@ async def backfill(
     start_date: dt.date,
     end_date: dt.date,
     city_filter: list[str] | None = None,
+    fetch_price_history: bool = True,
+    fetch_clob_markets: bool = True,
 ) -> None:
     cities    = _load_cities()
     if city_filter:
@@ -325,24 +334,29 @@ async def backfill(
                     if not condition_id:
                         continue
 
-                    clob = await _fetch_clob(client, condition_id)
-                    _upsert_market(conn, city, event_slug, day, event, market, clob)
+                    clob = await _fetch_clob(client, condition_id) if fetch_clob_markets else None
+                    _upsert_market(conn, city, event_slug, day, event, market, clob, "backfill")
                     await asyncio.sleep(0.05)
 
                     if not clob:
+                        _infer_gamma_settlement_outcome(market, condition_id, conn)
                         continue
 
-                    # 2. Price history per token
-                    for token in (clob.get("tokens") or []):
-                        tid = token.get("token_id")
-                        if tid:
-                            n = await _fetch_price_history(client, tid, condition_id, conn)
-                            if n:
-                                log.debug("    %s: %d price points", condition_id[:10], n)
-                            await asyncio.sleep(0.05)
+                    # 2. Price history per token. Optional because this is slow and
+                    # not needed for forecast-vs-resolution research.
+                    if fetch_price_history:
+                        for token in (clob.get("tokens") or []):
+                            tid = token.get("token_id")
+                            if tid:
+                                n = await _fetch_price_history(
+                                    client, tid, condition_id, conn, token.get("outcome")
+                                )
+                                if n:
+                                    log.debug("    %s: %d price points", condition_id[:10], n)
+                                await asyncio.sleep(0.05)
 
                     # 3. Settlement outcome (for resolved markets)
-                    await _fetch_settlement_outcome(client, condition_id, conn)
+                    await _fetch_settlement_outcome(client, condition_id, conn, clob)
                     await asyncio.sleep(0.05)
 
                 conn.commit()
@@ -355,9 +369,8 @@ async def backfill(
 
 
 def _summary(conn: sqlite3.Connection) -> None:
-    ph_pat  = "%prices_history%"
     markets = conn.execute("SELECT COUNT(*) FROM weather_markets").fetchone()[0]
-    prices  = conn.execute("SELECT COUNT(*) FROM ob_snapshots WHERE raw_book_json LIKE ?", (ph_pat,)).fetchone()[0]
+    prices  = conn.execute("SELECT COUNT(*) FROM market_price_history").fetchone()[0]
     archive = conn.execute("SELECT COUNT(*) FROM settlement_observations WHERE source_type='open_meteo_archive'").fetchone()[0]
     resolved= conn.execute("SELECT COUNT(*) FROM market_resolutions").fetchone()[0]
     cities  = conn.execute("SELECT COUNT(DISTINCT city) FROM weather_markets").fetchone()[0]
@@ -379,6 +392,10 @@ if __name__ == "__main__":
     parser.add_argument("--end",    help="End date YYYY-MM-DD (default: yesterday)")
     parser.add_argument("--cities", nargs="+",
                         help="Subset of cities to backfill (default: all 17)")
+    parser.add_argument("--skip-price-history", action="store_true",
+                        help="Skip slow CLOB prices-history; still fetch markets, outcomes, and archive weather")
+    parser.add_argument("--skip-clob-markets", action="store_true",
+                        help="Skip per-condition CLOB market fetches; infer resolved outcomes from Gamma outcomePrices")
     args = parser.parse_args()
 
     today     = dt.datetime.now(dt.timezone.utc).date()
@@ -394,6 +411,13 @@ if __name__ == "__main__":
     conn.row_factory = sqlite3.Row
     init_db(conn)
 
-    asyncio.run(backfill(conn, start_date, end_date, args.cities))
+    asyncio.run(backfill(
+        conn,
+        start_date,
+        end_date,
+        args.cities,
+        not args.skip_price_history,
+        not args.skip_clob_markets,
+    ))
     _summary(conn)
     conn.close()

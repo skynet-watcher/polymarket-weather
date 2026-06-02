@@ -10,6 +10,7 @@ Start here:
 - `scripts/discover_markets.py` — find active weather markets
 - `scripts/log_orderbooks.py` — collect CLOB order book snapshots
 - `scripts/fetch_weather.py` — collect weather observations from settlement sources
+- `scripts/backfill_model_forecasts.py` — backfill historical model forecasts from Open-Meteo Previous Runs
 - `scripts/fetch_settlement_sources.py` — collect source-of-record daily highs where adapters exist
 - `scripts/settle_markets.py` — apply proxy settlement values to bucket outcomes
 - `scripts/neg_risk_scanner.py` — scan temperature-market pricing gaps

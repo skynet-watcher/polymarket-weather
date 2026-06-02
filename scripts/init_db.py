@@ -65,6 +65,7 @@ CREATE TABLE IF NOT EXISTS model_forecasts (
     lat REAL,
     lon REAL,
     model_run_is_estimated INTEGER DEFAULT 1,
+    source_metadata_json TEXT,
     raw_payload_json TEXT,
     UNIQUE(station, model, model_run_utc, forecast_date)
 );
@@ -94,9 +95,12 @@ CREATE TABLE IF NOT EXISTS weather_markets (
     temp_window_start_utc TEXT,
     close_time_utc TEXT,
     accepting_order_ts_utc TEXT,
+    market_start_utc TEXT,
     neg_risk_market_id TEXT,
     neg_risk_request_id TEXT,
     first_seen_utc TEXT,
+    first_seen_source TEXT DEFAULT 'live_discovery',
+    backfilled_at_utc TEXT,
     settlement_value_proxy REAL,
     settlement_value_final REAL,
     proxy_outcome TEXT,
@@ -135,6 +139,23 @@ CREATE TABLE IF NOT EXISTS ob_snapshots (
 );
 CREATE INDEX IF NOT EXISTS ix_ob_cid_ts
     ON ob_snapshots(condition_id, ts_utc);
+
+CREATE TABLE IF NOT EXISTS market_price_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    token_id TEXT NOT NULL,
+    condition_id TEXT NOT NULL,
+    outcome TEXT,
+    ts_utc TEXT NOT NULL,
+    price REAL NOT NULL,
+    fidelity_minutes INTEGER,
+    source TEXT NOT NULL DEFAULT 'clob_prices_history',
+    raw_payload_json TEXT,
+    UNIQUE(token_id, ts_utc, source)
+);
+CREATE INDEX IF NOT EXISTS ix_price_history_cid_ts
+    ON market_price_history(condition_id, ts_utc);
+CREATE INDEX IF NOT EXISTS ix_price_history_token_ts
+    ON market_price_history(token_id, ts_utc);
 
 CREATE TABLE IF NOT EXISTS fetch_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -251,6 +272,7 @@ def _migrate_existing_tables(conn: sqlite3.Connection) -> None:
     })
     _add_missing_columns(conn, "model_forecasts", {
         "model_run_is_estimated": "INTEGER DEFAULT 1",
+        "source_metadata_json": "TEXT",
         "raw_payload_json": "TEXT",
     })
     _add_missing_columns(conn, "weather_markets", {
@@ -268,9 +290,12 @@ def _migrate_existing_tables(conn: sqlite3.Connection) -> None:
         "temp_window_start_utc": "TEXT",
         "close_time_utc": "TEXT",
         "accepting_order_ts_utc": "TEXT",
+        "market_start_utc": "TEXT",
         "neg_risk_market_id": "TEXT",
         "neg_risk_request_id": "TEXT",
         "first_seen_utc": "TEXT",
+        "first_seen_source": "TEXT DEFAULT 'live_discovery'",
+        "backfilled_at_utc": "TEXT",
         "settlement_value_proxy": "REAL",
         "settlement_value_final": "REAL",
         "proxy_outcome": "TEXT",
