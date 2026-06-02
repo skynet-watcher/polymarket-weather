@@ -178,6 +178,7 @@ CREATE TABLE IF NOT EXISTS settlement_observations (
     value REAL,
     unit TEXT,
     precision TEXT,
+    is_final INTEGER DEFAULT 0,
     fetched_utc TEXT NOT NULL,
     raw_payload_json TEXT
 );
@@ -285,6 +286,9 @@ def _migrate_existing_tables(conn: sqlite3.Connection) -> None:
         "settlement_date": "TEXT",
         "status": "TEXT DEFAULT 'open'",
         "closed_utc": "TEXT",
+    })
+    _add_missing_columns(conn, "settlement_observations", {
+        "is_final": "INTEGER DEFAULT 0",
     })
     _add_missing_columns(conn, "ob_snapshots", {
         "yes_bid_size": "REAL",

@@ -215,6 +215,11 @@ Required additions:
   settlement values to cancelled markets, as `proxy_outcome` would be meaningless.
 - `market_resolutions.resolved_outcome` must accept `'CANCELLED'` alongside 'YES' and 'NO'.
 
+Source adapters may store partial in-progress daily values in `settlement_observations`,
+but they must not promote those values into `weather_markets.settlement_value_proxy`
+until the station-local source day has completed plus the finalization buffer. Finality
+is tracked with `settlement_observations.is_final`.
+
 ### All weather staircase markets are neg-risk markets
 
 Confirmed from CLOB API: `neg_risk: true` for every weather bucket market.
@@ -1005,6 +1010,7 @@ CREATE TABLE settlement_observations (
     value           REAL,
     unit            TEXT,
     precision       TEXT,
+    is_final        INTEGER DEFAULT 0,       -- 1 only after source-local day + finalization buffer
     fetched_utc     TEXT NOT NULL,
     raw_payload_json TEXT
 );
@@ -1405,7 +1411,7 @@ Tests marked ⚠️ **Partial** can run but results will be incomplete.
 
 | Test | Required captured data | Status |
 |------|------------------------|--------|
-| Resolution source mismatch audit | `weather_markets.rules_text`, `rules_source`, `resolution_source_type`, `settlement_observations.value/unit/raw_payload_json`, `wx_observations.daily_high_c`, `market_resolutions.resolved_outcome/resolved_value` | ⛔ Blocked — WU adapter missing; ~82% of markets have no `settlement_value_proxy` |
+| Resolution source mismatch audit | `weather_markets.rules_text`, `rules_source`, `resolution_source_type`, `settlement_observations.value/unit/is_final/raw_payload_json`, `wx_observations.daily_high_c`, `market_resolutions.resolved_outcome/resolved_value` | ⚠️ Partial — source adapters can log WU proxy/HKO/NOAA values, but final Polymarket/UMA reconciliation is still pending |
 | Liquidity / executability filter | `ob_snapshots.yes_bid/yes_ask/no_bid/no_ask`, all size fields, `spread`, `raw_book_json`, `hours_to_close` | ✅ Ready |
 | Already priced in | source `observed_utc` or model valid/run time, `fetched_utc`, first `ob_snapshots.ts_utc` after fetch, pre-fetch and post-fetch price deltas | ✅ Ready |
 | Data delay / source latency | source valid/publish time where available, system `fetched_utc`, first DB insert/change time, first orderbook snapshot after fetch | ✅ Ready |
@@ -1414,11 +1420,11 @@ Tests marked ⚠️ **Partial** can run but results will be incomplete.
 | Market-open forecast accuracy | `weather_markets.first_seen_utc`, `model_forecasts.fetched_utc <= first_seen_utc`, opening bucket prices, final settlement value | ⚠️ Partial — `open` snapshot label not yet firing; only GFS for forecasts |
 | Forecast consensus vs market | all model forecasts for same station/local_date, opening or selected-time market distribution, final settlement value | ⛔ Blocked — requires ≥3 models; currently only GFS + TAF (partial) |
 | Best forecast timing by station | forecast `fetched_utc`, `model_run_utc`, `hours_before_close`, station timezone/local date, final settlement value | ⚠️ Partial — single model limits per-station comparison |
-| Dynamic rebalancing | full sequence of forecasts, observations, settlement-source updates, orderbook snapshots, and simulated position events | ⛔ Blocked — WU adapter missing for most cities |
+| Dynamic rebalancing | full sequence of forecasts, observations, settlement-source updates, orderbook snapshots, and simulated position events | ⚠️ Partial — source proxy data can be collected, but final reconciliation and multi-day samples are still pending |
 | Negative-risk gaps | `weather_markets.neg_risk_market_id`, bucket lower/upper/unit/type, executable prices/sizes for every bucket in group | ✅ Ready |
 | Local-time weather path | `wx_observations.local_hour`, `is_in_peak_window`, station timezone, orderbook repricing after local milestones | ✅ Ready |
-| Station reliability | forecast error, proxy/source mismatch rate, intraday volatility, late-day new highs, liquidity/spread/repricing metrics | ⛔ Blocked — needs WU adapter + multiple models + 2+ weeks of data |
-| Bucket adjacency / hedge quality | bucket intervals, neg-risk group, executable bid/ask/size, settlement outcome, capital-at-risk model | ⛔ Blocked — WU adapter missing; no confirmed settlement values |
+| Station reliability | forecast error, proxy/source mismatch rate, intraday volatility, late-day new highs, liquidity/spread/repricing metrics | ⛔ Blocked — needs multiple models + 2+ weeks of data |
+| Bucket adjacency / hedge quality | bucket intervals, neg-risk group, executable bid/ask/size, settlement outcome, capital-at-risk model | ⚠️ Partial — proxy settlement can run, but final Polymarket/UMA confirmation is still pending |
 
 This matrix is the build contract. `scripts/init_db.py` must create every field needed here,
 and analysis scripts should fail loudly when required data is absent.

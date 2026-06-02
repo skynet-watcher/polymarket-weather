@@ -74,7 +74,8 @@ def _load_groups(conn: sqlite3.Connection, settlement_date: str | None) -> list[
             settlement_unit,
             resolution_source_type,
             resolution_source_url,
-            rules_source
+            rules_source,
+            min(temp_window_start_utc) AS temp_window_start_utc
         FROM weather_markets
         {where}
         GROUP BY city, station, settlement_date, settlement_unit,
@@ -92,19 +93,32 @@ def _upsert_observation(
     value: float,
     unit: str,
     precision: str,
+    is_final: bool,
     fetched_utc: str,
     raw: dict | str,
 ) -> None:
     raw_payload = raw if isinstance(raw, str) else json.dumps(raw, sort_keys=True)
     conn.execute("""
         INSERT INTO settlement_observations
-            (condition_id, city, station, source_name, source_type, source_url,
-             local_date, value, unit, precision, fetched_utc, raw_payload_json)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+            (
+                condition_id, city, station, source_name, source_type, source_url,
+                local_date, value, unit, precision, is_final, fetched_utc, raw_payload_json
+            )
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
     """, (
-        group["condition_id"], group["city"], group["station"],
-        source_name, source_type, group.get("resolution_source_url"),
-        group["settlement_date"], value, unit, precision, fetched_utc, raw_payload,
+        group["condition_id"],
+        group["city"],
+        group["station"],
+        source_name,
+        source_type,
+        group.get("resolution_source_url"),
+        group["settlement_date"],
+        value,
+        unit,
+        precision,
+        int(is_final),
+        fetched_utc,
+        raw_payload,
     ))
 
 
@@ -113,12 +127,32 @@ def _latest_settlement_observation(conn: sqlite3.Connection, group: dict) -> sql
     Multiple rows per city+date are expected (corrections arrive as new rows).
     """
     return conn.execute("""
-        SELECT value, unit, source_type, fetched_utc
+        SELECT value, unit, source_type, fetched_utc, is_final
         FROM settlement_observations
-        WHERE city=? AND local_date=? AND source_type=?
+        WHERE city=?
+          AND local_date=?
+          AND source_type=?
+          AND is_final=1
         ORDER BY fetched_utc DESC
         LIMIT 1
     """, (group["city"], group["settlement_date"], group["resolution_source_type"])).fetchone()
+
+
+def _parse_utc(value: str | None) -> dt.datetime | None:
+    if not value:
+        return None
+    parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed.astimezone(dt.timezone.utc)
+
+
+def _source_day_is_final(group: dict, fetched_utc: str, buffer_hours: int = 2) -> bool:
+    start = _parse_utc(group.get("temp_window_start_utc"))
+    fetched = _parse_utc(fetched_utc)
+    if not start or not fetched:
+        return False
+    return fetched >= start + dt.timedelta(hours=24 + buffer_hours)
 
 
 def _write_proxy_to_markets(conn: sqlite3.Connection, group: dict, fetched_utc: str) -> None:
@@ -285,18 +319,19 @@ async def fetch_once(conn: sqlite3.Connection, settlement_date: str | None = Non
                     if not ok:
                         log.info("%-12s HKO pending: %s", group["city"], payload)
                         continue
+                    is_final = _source_day_is_final(group, fetched_utc)
                     _upsert_observation(conn, group, "Hong Kong Observatory", source_type,
                                         payload["value"], payload["unit"], "one_decimal",
-                                        fetched_utc, payload)
-
+                                        is_final, fetched_utc, payload)
                 elif source_type == "noaa_wrh_timeseries":
                     ok, payload = await _fetch_noaa_wrh(client, group, fetched_utc)
                     if not ok:
                         log.info("%-12s NOAA pending: %s", group["city"], payload)
                         continue
+                    is_final = _source_day_is_final(group, fetched_utc)
                     _upsert_observation(conn, group, "NOAA WRH/Synoptic", source_type,
                                         payload["value"], payload["unit"], "whole_or_decimal",
-                                        fetched_utc, payload.get("raw", payload))
+                                        is_final, fetched_utc, payload.get("raw", payload))
 
                 elif source_type == "wunderground_daily":
                     ok, payload = await _fetch_wu(client, group, fetched_utc)
@@ -304,9 +339,10 @@ async def fetch_once(conn: sqlite3.Connection, settlement_date: str | None = Non
                         log.info("%-12s WU pending: %s", group["city"], payload)
                         continue
                     adapter = payload.get("adapter", "wunderground_daily")
+                    is_final = _source_day_is_final(group, fetched_utc)
                     _upsert_observation(conn, group, f"Wunderground ({adapter})", source_type,
                                         payload["value"], payload["unit"], "whole_degree",
-                                        fetched_utc, payload.get("raw", payload))
+                                        is_final, fetched_utc, payload.get("raw", payload))
 
                 else:
                     log.info("%-12s %s: no adapter", group["city"], source_type)
@@ -315,9 +351,8 @@ async def fetch_once(conn: sqlite3.Connection, settlement_date: str | None = Non
                 _write_proxy_to_markets(conn, group, fetched_utc)
                 conn.commit()
                 saved += 1
-                log.info("%-12s %-28s saved (%.1f°C)", group["city"], source_type,
-                         _latest_settlement_observation(conn, group)["value"])
-
+                log.info("%-12s %-28s saved (%s)", group["city"], source_type,
+                         "final" if is_final else "partial")
             except Exception as exc:
                 log.warning("%-12s %-28s failed: %s", group["city"], source_type, exc)
 
