@@ -280,6 +280,14 @@ def _migrate_existing_tables(conn: sqlite3.Connection) -> None:
         "settled_at_utc": "TEXT",
         "cancelled_at_utc": "TEXT",
     })
+    cols = _columns(conn, "weather_markets")
+    if {"game_start_time_utc", "temp_window_start_utc"}.issubset(cols):
+        conn.execute("""
+            UPDATE weather_markets
+            SET temp_window_start_utc=game_start_time_utc
+            WHERE temp_window_start_utc IS NULL
+              AND game_start_time_utc IS NOT NULL
+        """)
     _add_missing_columns(conn, "alerts", {
         "opened_utc": "TEXT",
         "last_seen_utc": "TEXT",

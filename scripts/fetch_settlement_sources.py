@@ -155,10 +155,21 @@ def _source_day_is_final(group: dict, fetched_utc: str, buffer_hours: int = 2) -
     return fetched >= start + dt.timedelta(hours=24 + buffer_hours)
 
 
+def _convert_units(value: float, from_unit: str | None, to_unit: str | None) -> float:
+    if not from_unit or not to_unit or from_unit == to_unit:
+        return value
+    if from_unit == "C" and to_unit == "F":
+        return value * 9 / 5 + 32
+    if from_unit == "F" and to_unit == "C":
+        return (value - 32) * 5 / 9
+    raise ValueError(f"Unsupported unit conversion: {from_unit} to {to_unit}")
+
+
 def _write_proxy_to_markets(conn: sqlite3.Connection, group: dict, fetched_utc: str) -> None:
     obs = _latest_settlement_observation(conn, group)
     if not obs:
         return
+    proxy_value = _convert_units(obs["value"], obs["unit"], group["settlement_unit"])
     conn.execute("""
         UPDATE weather_markets
         SET settlement_value_proxy=?,
@@ -167,7 +178,7 @@ def _write_proxy_to_markets(conn: sqlite3.Connection, group: dict, fetched_utc: 
             settled_at_utc=COALESCE(settled_at_utc, ?)
         WHERE city=? AND settlement_date=? AND resolution_source_type=?
     """, (
-        obs["value"], obs["source_type"], fetched_utc,
+        proxy_value, obs["source_type"], fetched_utc,
         group["city"], group["settlement_date"], group["resolution_source_type"],
     ))
 
