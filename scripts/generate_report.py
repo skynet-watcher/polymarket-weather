@@ -126,13 +126,25 @@ def build(db_path=DB_PATH) -> str:
             SELECT MAX(temp_c) FROM wx_observations WHERE city=? AND local_date=?
         """, (city, sdate)).fetchone()[0]
 
-        # Forecasts
-        forecasts = conn.execute("""
-            SELECT model, high_c FROM model_forecasts mf
-            JOIN weather_markets wm ON mf.station=wm.station AND mf.forecast_date=wm.settlement_date
-            WHERE wm.city=? AND wm.settlement_date=? AND wm.active=1
-            GROUP BY mf.model HAVING mf.fetched_utc=MAX(mf.fetched_utc)
-        """, (city, sdate)).fetchall()
+        # Forecasts — exact settlement date first, fallback to most recent available
+        station_row = conn.execute(
+            "SELECT station FROM weather_markets WHERE city=? AND active=1 LIMIT 1", (city,)
+        ).fetchone()
+        station_id = station_row["station"] if station_row else None
+        forecasts = []
+        if station_id:
+            forecasts = conn.execute("""
+                SELECT model, high_c FROM model_forecasts
+                WHERE station=? AND forecast_date=?
+                GROUP BY model HAVING fetched_utc=MAX(fetched_utc)
+            """, (station_id, sdate)).fetchall()
+            if not forecasts:
+                forecasts = conn.execute("""
+                    SELECT model, high_c FROM model_forecasts
+                    WHERE station=?
+                      AND forecast_date=(SELECT MAX(forecast_date) FROM model_forecasts WHERE station=?)
+                    GROUP BY model HAVING fetched_utc=MAX(fetched_utc)
+                """, (station_id, station_id)).fetchall()
         highs = [f["high_c"] for f in forecasts if f["high_c"]]
         fcst_avg = round(sum(highs)/len(highs), 1) if highs else None
 

@@ -144,16 +144,23 @@ def get_overview(conn) -> list[dict]:
             LIMIT 1
         """, (city, sdate)).fetchone()
 
-        # Latest forecast
+        # Latest forecast — exact date first, then fallback to most recent available
         fcst = conn.execute("""
-            SELECT AVG(high_c) as avg_high, GROUP_CONCAT(DISTINCT model) as models
+            SELECT AVG(high_c) as avg_high, COUNT(DISTINCT model) as n_models
             FROM model_forecasts
             WHERE station=(SELECT station FROM weather_markets WHERE city=? LIMIT 1)
               AND forecast_date=?
-              AND fetched_utc=(SELECT MAX(fetched_utc) FROM model_forecasts
-                               WHERE station=(SELECT station FROM weather_markets WHERE city=? LIMIT 1)
-                               AND forecast_date=?)
-        """, (city, sdate, city, sdate)).fetchone()
+        """, (city, sdate)).fetchone()
+        if not fcst or not fcst["avg_high"]:
+            fcst = conn.execute("""
+                SELECT AVG(high_c) as avg_high, COUNT(DISTINCT model) as n_models
+                FROM model_forecasts
+                WHERE station=(SELECT station FROM weather_markets WHERE city=? LIMIT 1)
+                  AND forecast_date=(
+                      SELECT MAX(forecast_date) FROM model_forecasts
+                      WHERE station=(SELECT station FROM weather_markets WHERE city=? LIMIT 1)
+                  )
+            """, (city, city)).fetchone()
 
         # Status
         if settled:
@@ -287,7 +294,10 @@ def get_city_detail(conn, city: str) -> dict:
         ORDER BY COALESCE(wm.lower_temp, wm.upper_temp) DESC
     """, (city, sdate)).fetchall()
 
-    # All forecast runs for this station+date — full history per model
+    # All forecast runs for this station+date.
+    # Primary: exact settlement_date match (live forecast).
+    # Fallback: most recent available forecast_date for this station
+    # (covers the gap before first live fetch, or if models skipped a day).
     all_forecasts = conn.execute("""
         SELECT model, high_c, low_c, fetched_utc, model_run_utc,
                forecast_date, horizon_hours, model_run_is_estimated
@@ -295,6 +305,19 @@ def get_city_detail(conn, city: str) -> dict:
         WHERE station=? AND forecast_date=?
         ORDER BY model, fetched_utc ASC
     """, (station, sdate)).fetchall()
+
+    if not all_forecasts:
+        # Fallback: pick the most recently fetched forecast for this station
+        all_forecasts = conn.execute("""
+            SELECT model, high_c, low_c, fetched_utc, model_run_utc,
+                   forecast_date, horizon_hours, model_run_is_estimated
+            FROM model_forecasts
+            WHERE station=?
+              AND forecast_date = (
+                  SELECT MAX(forecast_date) FROM model_forecasts WHERE station=?
+              )
+            ORDER BY model, fetched_utc ASC
+        """, (station, station)).fetchall()
 
     # Latest value per model (for summary)
     latest_fcst: dict[str, dict] = {}
