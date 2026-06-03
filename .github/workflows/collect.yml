@@ -44,7 +44,7 @@ jobs:
 
       # Restore the most recent DB from cache
       - name: Restore DB
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v4.0.0
         with:
           path: weather.db
           key: weather-db-${{ github.run_id }}
@@ -140,7 +140,7 @@ jobs:
 
       # Save DB back to cache
       - name: Save DB
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v4.0.0
         if: always()
         with:
           path: weather.db
